@@ -1,0 +1,20 @@
+[project]
+name = "ask-expert"
+version = "0.1.0"
+description = "Consult a frontier model as a bare, stateless expert over an OpenAI-compatible endpoint"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=3.4.7",
+    "openai>=1.70.0",
+]
+
+[project.scripts]
+ask-expert = "ask_expert.server:main"
+
+[tool.uv]
+package = true
+
+# flat layout 下 setuptools 自动发现会把运行时数据目录 state/ 也当成命名空间包，
+# 导致 "Multiple top-level packages discovered" 构建失败；显式限定为单个包。
+[tool.setuptools]
+packages = ["ask_expert"]
