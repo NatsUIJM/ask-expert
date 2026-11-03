@@ -1,5 +1,7 @@
 # ask-expert
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/natsuijm-ask-expert-nmyvb7?v=5f80124cd8dd6ef0e5bc353a9dd5bc08)](https://m8ven.ai/mcp/natsuijm-ask-expert-nmyvb7?s=readme)
+
 A small MCP server that lets a weaker agent consult a bare frontier model (no tools, no memory, stateless single turn) on demand. The server enforces *when to ask / how to ask / how to use the answer* at the three places the model actually reads: the tool description, the argument schema, and the return-value wrapper.
 
 向一个**裸的强模型**（无工具、无记忆、单轮无状态）按需咨询的 MCP 服务。
