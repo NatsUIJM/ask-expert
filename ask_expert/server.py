@@ -72,9 +72,37 @@ REQUIRED_ENV_VARS = (
 )
 
 
-def _missing_required_env() -> list[tuple[str, str]]:
-    """返回缺失/为空的必填环境变量 (名称, 说明)，供工具返回可操作的配置提示。"""
-    values = {"ASK_EXPERT_API_KEY": API_KEY, "ASK_EXPERT_BASE_URL": BASE_URL, "ASK_EXPERT_MODEL": MODEL}
+def _effective_conn(
+    *, api_key: str = "", base_url: str = "", model: str = ""
+) -> tuple[str, str, str]:
+    """解析本次调用的连接三项，返回 (base_url, api_key, model)。
+
+    工具参数为空（默认）时回落到环境变量；非空时该参数覆盖环境变量。
+    三项各自独立回落，允许只覆盖其中一项。返回的 model 用于出站请求、
+    去重键与缓存键，保证不同端点/模型的缓存互不串用。
+    """
+    return (
+        (base_url or "").strip() or BASE_URL,
+        (api_key or "").strip() or API_KEY,
+        (model or "").strip() or MODEL,
+    )
+
+
+def _missing_required_env(
+    *, api_key: str = "", base_url: str = "", model: str = ""
+) -> list[tuple[str, str]]:
+    """返回缺失/为空的必填连接项 (名称, 说明)，供工具返回可操作的配置提示。
+
+    工具参数覆盖后的有效值仍然为空才算缺失——调用方显式传参时不需要配置环境变量。
+    """
+    resolved_url, resolved_key, resolved_model = _effective_conn(
+        api_key=api_key, base_url=base_url, model=model
+    )
+    values = {
+        "ASK_EXPERT_API_KEY": resolved_key,
+        "ASK_EXPERT_BASE_URL": resolved_url,
+        "ASK_EXPERT_MODEL": resolved_model,
+    }
     return [(name, desc) for name, desc in REQUIRED_ENV_VARS if not values[name]]
 
 
@@ -149,19 +177,27 @@ for _state_dir in (CACHE_DIR, CONSULT_DIR, PARTIAL_DIR):
 
 mcp = FastMCP("ask-expert")
 
-_client: AsyncOpenAI | None = None
+_clients: dict[tuple[str, str], AsyncOpenAI] = {}
 
 
-def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        _client = AsyncOpenAI(
-            base_url=BASE_URL,
-            api_key=API_KEY,
+def _get_client(*, base_url: str = "", api_key: str = "") -> AsyncOpenAI:
+    """按 (端点, 密钥) 复用客户端；参数为空时用环境变量配置。
+
+    不同端点/密钥需要各自的客户端（base_url 与凭据在客户端构造时固定），
+    因此这里用字典缓存而不是单例。
+    """
+    resolved_url, resolved_key, _ = _effective_conn(base_url=base_url, api_key=api_key)
+    cache_key = (resolved_url, resolved_key)
+    client = _clients.get(cache_key)
+    if client is None:
+        client = AsyncOpenAI(
+            base_url=resolved_url,
+            api_key=resolved_key,
             timeout=TIMEOUT,
             max_retries=1,
         )
-    return _client
+        _clients[cache_key] = client
+    return client
 
 
 # ------------------------------------------------------------------- 提示词
@@ -717,13 +753,16 @@ def _dedup_key(
     evidence: str = "",
     artifact_name: str = "",
     scope: str = "",
+    base_url: str = "",
+    model: str = "",
 ) -> str:
+    resolved_url, _, resolved_model = _effective_conn(base_url=base_url, model=model)
     normalized = "\n".join(
         re.sub(r"\s+", " ", s or "").strip()
         for s in (
             PROMPT_VERSION,
-            BASE_URL,
-            MODEL,
+            resolved_url,
+            resolved_model,
             mode,
             question_type,
             prior_consult_id,
@@ -828,6 +867,7 @@ def _record_consult(
     mode: str = "consult",
     verdict: str = "",
     findings_count: int = 0,
+    model: str = "",
 ) -> None:
     _save_consult(
         {
@@ -840,7 +880,7 @@ def _record_consult(
             "findings_count": findings_count,
             "answer": (answer or "")[:8000],
             "missing_information": list(missing_info or [])[:5],
-            "model": MODEL,
+            "model": model or MODEL,
             "prompt_version": PROMPT_VERSION,
             "prior_consult_id": prior_consult_id,
             "created_at": _now_iso(),
@@ -1003,12 +1043,21 @@ async def _stream_consult(
     ctx: "Context | None" = None,
     on_partial=None,
     system_prompt: str | None = None,
+    *,
+    api_key: str = "",
+    base_url: str = "",
+    model: str = "",
 ) -> tuple[_StreamResult, int]:
     """发起流式调用并累计结果。对可重试错误做有限次退避重试。
 
     system_prompt 为空时使用咨询模式的默认人设；审计模式传入审计员人设。
+    api_key/base_url/model 为空时用环境变量配置，非空时覆盖。
     返回 (结果, 实际重试次数)。
     """
+    resolved_url, resolved_key, resolved_model = _effective_conn(
+        api_key=api_key, base_url=base_url, model=model
+    )
+    client = _get_client(base_url=resolved_url, api_key=resolved_key)
     last_exc: Exception | None = None
     for attempt in range(STREAM_RETRIES + 1):
         # 节流进度通知：每 PROGRESS_INTERVAL 秒至多一条，避免通知风暴
@@ -1036,8 +1085,8 @@ async def _stream_consult(
         try:
             await _respect_rate_limit()
             request_started = time.monotonic()
-            stream = await _get_client().chat.completions.create(
-                model=MODEL,
+            stream = await client.chat.completions.create(
+                model=resolved_model,
                 messages=[
                     {"role": "system", "content": system_prompt or EXPERT_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -1093,12 +1142,20 @@ async def _run_expert(
     prior_audit_id: str = "",
     extra_evidence: str = "",
     auto_depth: int = 0,
+    api_key: str = "",
+    base_url: str = "",
+    model: str = "",
 ) -> str:
     is_audit = mode == "audit"
     prior_id = prior_audit_id if is_audit else prior_consult_id
     id_field = "audit_id" if is_audit else "consult_id"
 
-    missing_env = _missing_required_env()
+    resolved_url, resolved_key, resolved_model = _effective_conn(
+        api_key=api_key, base_url=base_url, model=model
+    )
+    missing_env = _missing_required_env(
+        api_key=api_key, base_url=base_url, model=model
+    )
     if missing_env:
         _log(
             {
@@ -1112,7 +1169,8 @@ async def _run_expert(
             f"{'、'.join(f'{name}（{desc}）' for name, desc in missing_env)}。"
             "请在 Cherry Studio「设置 → MCP 服务器 → ask-expert → 编辑 → 环境变量」中"
             "按每行一项填写（ASK_EXPERT_API_KEY=...、ASK_EXPERT_BASE_URL=...、"
-            "ASK_EXPERT_MODEL=...），保存后重启该服务器再调用。"
+            "ASK_EXPERT_MODEL=...），保存后重启该服务器再调用；"
+            "或在本次调用中以 api_key / base_url / model 参数显式提供（仅当用户明确指定时）。"
             "请按现有证据继续推进，不要因此中断任务。"
         )
 
@@ -1177,6 +1235,8 @@ async def _run_expert(
         evidence=evidence,
         artifact_name=artifact_name,
         scope=scope,
+        base_url=resolved_url,
+        model=resolved_model,
     )
     cache_type = "audit" if is_audit else question_type
     cached = _cache_get(key, cache_type)
@@ -1245,7 +1305,13 @@ async def _run_expert(
     started = time.monotonic()
     try:
         stream_result, retries = await _stream_consult(
-            prompt, ctx, saver.update, system_prompt=system_prompt
+            prompt,
+            ctx,
+            saver.update,
+            system_prompt=system_prompt,
+            api_key=resolved_key,
+            base_url=resolved_url,
+            model=resolved_model,
         )
     except Exception as exc:
         saver.flush()
@@ -1273,6 +1339,7 @@ async def _run_expert(
                 missing_info=[],
                 prior_consult_id=prior_id,
                 mode=mode,
+                model=resolved_model,
             )
             return _frame(
                 partial,
@@ -1336,6 +1403,8 @@ async def _run_expert(
             "finish_reason": finish_reason,
             "elapsed_ms": elapsed_ms,
             "prompt_version": PROMPT_VERSION,
+            "model": resolved_model,
+            "base_url": resolved_url,
             "prior_consult_id": prior_id,
             "usage": stream_result.usage,
         }
@@ -1352,6 +1421,7 @@ async def _run_expert(
             missing_info=[],
             prior_consult_id=prior_id,
             mode=mode,
+            model=resolved_model,
         )
         return (
             f"[{'审计' if is_audit else '咨询'}未产出答案 · {id_field}={consult_id}] "
@@ -1372,6 +1442,7 @@ async def _run_expert(
             missing_info=[],
             prior_consult_id=prior_id,
             mode=mode,
+            model=resolved_model,
         )
         return (
             f"[{'审计' if is_audit else '咨询'}返回空内容 · {id_field}={consult_id}] "
@@ -1420,6 +1491,9 @@ async def _run_expert(
                 prior_audit_id=consult_id if is_audit else prior_audit_id,
                 extra_evidence=extra_text,
                 auto_depth=auto_depth + 1,
+                api_key=resolved_key,
+                base_url=resolved_url,
+                model=resolved_model,
             )
 
     _record_consult(
@@ -1433,6 +1507,7 @@ async def _run_expert(
         mode=mode,
         verdict=verdict,
         findings_count=findings_count,
+        model=resolved_model,
     )
 
     if status == "answered":
@@ -1444,7 +1519,7 @@ async def _run_expert(
                 "verdict": verdict,
                 "findings_count": findings_count,
                 "missing_information": [],
-                "model": MODEL,
+                "model": resolved_model,
                 "prompt_version": PROMPT_VERSION,
                 "question_type": question_type,
                 "mode": mode,
@@ -1519,6 +1594,9 @@ async def _consult(
     attempts: str = "",
     boundaries: str = "",
     prior_consult_id: str = "",
+    api_key: str = "",
+    base_url: str = "",
+    model: str = "",
     ctx: "Context | None" = None,
 ) -> str:
     return await _run_expert(
@@ -1531,6 +1609,9 @@ async def _consult(
         attempts=attempts,
         boundaries=boundaries,
         prior_consult_id=prior_consult_id,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
         ctx=ctx,
     )
 
@@ -1543,6 +1624,9 @@ async def _audit(
     scope: str = "",
     evidence: str = "",
     prior_audit_id: str = "",
+    api_key: str = "",
+    base_url: str = "",
+    model: str = "",
     ctx: "Context | None" = None,
 ) -> str:
     return await _run_expert(
@@ -1554,6 +1638,9 @@ async def _audit(
         scope=scope,
         evidence=evidence,
         prior_audit_id=prior_audit_id,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
         ctx=ctx,
     )
 
@@ -1570,6 +1657,9 @@ async def consult_expert(
     attempts: str = "",
     boundaries: str = "",
     prior_consult_id: str = "",
+    api_key: str = "",
+    base_url: str = "",
+    model: str = "",
     ctx: Context = None,
 ) -> str:
     """向一个顶级推理模型咨询单个自包含问题，返回文本答案。
@@ -1605,6 +1695,11 @@ async def consult_expert(
 【结构化证据请求】JSON；你可在本地执行只读查询后带 prior_consult_id 续问。
 返回的是候选假设，不是结论；必须按返回值末尾附带的处理要求验证后按部件采纳。
 
+【连接参数（强制）】api_key / base_url / model 三个可选参数只用于用户明确指定临时端点、
+密钥或模型的场景。用户未点名时，三者必须留空（不传），禁止猜测默认值、禁止"顺手从上下文
+带上"、禁止为了"更稳妥"自行填写。留空即按服务端环境变量执行；传入某一项时该项覆盖环境
+变量，其余两项仍按环境变量处理（三项各自独立判定）。
+
 Args:
     objective: 你要得到的单一、可判定的产出。禁止“帮我调研 X 领域”式的开放大问。
     context: 得出答案所必需的最小上下文（充分性优先于相关性）。只放客观工件（代码、报错、
@@ -1630,6 +1725,13 @@ Args:
     prior_consult_id: 上一次咨询返回的 consult_id。若上次 status=needs_evidence，按
         【需要补充的信息】补齐材料后把它传进来；服务端会把上次咨询的目标、回答摘要和
         缺少项一起交给专家，避免重复分析。普通新问题留空。
+    api_key: 可选。仅当**用户明确要求**使用指定密钥时才填写；否则一律留空（不传），
+        留空表示使用服务端环境变量 ASK_EXPERT_API_KEY。
+    base_url: 可选。仅当**用户明确要求**使用指定端点时才填写（OpenAI 兼容端点，
+        形如 https://host/v1）；否则一律留空（不传），留空表示使用服务端环境变量
+        ASK_EXPERT_BASE_URL。
+    model: 可选。仅当**用户明确要求**使用指定模型时才填写；否则一律留空（不传），
+        留空表示使用服务端环境变量 ASK_EXPERT_MODEL。
     """
     return await _consult(
         objective=objective,
@@ -1640,6 +1742,9 @@ Args:
         attempts=attempts,
         boundaries=boundaries,
         prior_consult_id=prior_consult_id,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
         ctx=ctx,
     )
 
@@ -1652,6 +1757,9 @@ async def audit_artifact(
     scope: str = "",
     evidence: str = "",
     prior_audit_id: str = "",
+    api_key: str = "",
+    base_url: str = "",
+    model: str = "",
     ctx: Context = None,
 ) -> str:
     """依据给定审计标准，对既成工件做证据核对的审计（与 consult_expert 的咨询模式不同）。
@@ -1676,6 +1784,11 @@ async def audit_artifact(
 3. 审计范围（scope）之外不因 PASS 而视为合格；按章节拆分审计时，跨节一致性需另行全文审计。
 4. 修复后必须用同一 checklist 复查对应层，修改可能引入新冲突。
 
+【连接参数（强制）】api_key / base_url / model 三个可选参数只用于用户明确指定临时端点、
+密钥或模型的场景。用户未点名时，三者必须留空（不传），禁止猜测默认值、禁止"顺手从上下文
+带上"、禁止为了"更稳妥"自行填写。留空即按服务端环境变量执行；传入某一项时该项覆盖环境
+变量，其余两项仍按环境变量处理（三项各自独立判定）。
+
 Args:
     artifact: 待审工件全文（论文正文、代码、报告等）。超过 `ASK_EXPERT_MAX_ARTIFACT_CHARS`
         会拒绝，要求按章节拆分并声明 scope。
@@ -1687,6 +1800,13 @@ Args:
         建议先由调用方跑机械检查，把结果放这里，专家只做语义判断与交叉核对。
     prior_audit_id: 上一次审计返回的 audit_id；补齐【需要补充的信息】后续审时传入，
         服务端会带上上次目标、回答摘要与缺失项，避免重复分析。
+    api_key: 可选。仅当**用户明确要求**使用指定密钥时才填写；否则一律留空（不传），
+        留空表示使用服务端环境变量 ASK_EXPERT_API_KEY。
+    base_url: 可选。仅当**用户明确要求**使用指定端点时才填写（OpenAI 兼容端点，
+        形如 https://host/v1）；否则一律留空（不传），留空表示使用服务端环境变量
+        ASK_EXPERT_BASE_URL。
+    model: 可选。仅当**用户明确要求**使用指定模型时才填写；否则一律留空（不传），
+        留空表示使用服务端环境变量 ASK_EXPERT_MODEL。
     """
     return await _audit(
         artifact=artifact,
@@ -1695,6 +1815,9 @@ Args:
         scope=scope,
         evidence=evidence,
         prior_audit_id=prior_audit_id,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
         ctx=ctx,
     )
 

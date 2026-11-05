@@ -36,6 +36,9 @@ question_type: str    # 可选。code_debug / math_reasoning / open_research / o
 attempts: str         # code_debug 时必填。失败现场；已被证伪的旧答案须在此显式作废
 boundaries: str       # 可选。任务边界与停止条件
 prior_consult_id: str # 可选。上次 status=needs_evidence 的 consult_id；补齐材料后续问
+api_key: str          # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_API_KEY
+base_url: str         # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_BASE_URL
+model: str            # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_MODEL
 ```
 
 `trigger` 是必填的自我审计字段：模型必须写出可观测依据，填不出来即说明不该调用。
@@ -116,6 +119,9 @@ artifact_name: str   # 可选。名称 + 版本标识
 scope: str           # 可选。本次审计范围；scope 外不因 PASS 视为合格
 evidence: str        # 可选。确定性检查/检索产出的证据包
 prior_audit_id: str  # 可选。补齐材料后续审
+api_key: str         # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_API_KEY
+base_url: str        # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_BASE_URL
+model: str           # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_MODEL
 ```
 
 输出结构固定为 `## 发现`（每条 `[S1|位置] 问题 | 证据：原文 vs 依据`）、
@@ -185,6 +191,11 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
 服务端不读取 `.env`**。它们由调用方在 Cherry Studio MCP 服务器设置的「环境变量」输入框中
 按 `KEY=value` 每行一项注入；缺失时服务照常启动，工具调用返回缺失清单（并记入
 `state/consult_log.jsonl` 的 `missing_env` 事件），不会中断任务。
+
+**单次调用覆盖（可选参数）**：两个工具都接受 `api_key` / `base_url` / `model` 三个可选参数，
+默认空字符串。留空（不传）时使用上表环境变量；传入某一项时该项覆盖环境变量，其余两项仍取
+环境变量（三项各自独立回落）。工具描述明确要求：**用户未明确指定时，三者必须留空、不得猜测
+默认值**。覆盖值参与去重键与缓存键（端点 × 模型），不会与默认配置串用缓存。
 
 其余参数均可选，未设置时使用下表默认值。
 
@@ -292,6 +303,16 @@ uv run ask-expert              # 启动 stdio 服务（同样需要三项环境�
 验证注册命令、工具注册、参数绑定、拒绝分支与真实流式调用——含一次约 40 秒的实网调用。
 
 ## 变更记录
+
+### 2026-11-05 · 单次调用连接覆盖参数
+
+1. `consult_expert` / `audit_artifact` 新增三个**可选**参数 `api_key`、`base_url`、`model`。
+   留空（默认）时沿用 `ASK_EXPERT_*` 环境变量；传入时该项覆盖环境变量，其余两项独立回落。
+2. 工具描述写明调用纪律：**用户未明确要求时三者留空、不得猜测或顺手填写**；只有用户点名
+   临时端点/密钥/模型时才传。
+3. 客户端缓存改为按 `(base_url, api_key)` 复用；去重键、缓存键、咨询记录与 `call_ok` 日志
+   均使用解析后的有效端点与模型，覆盖调用不会与默认配置串用缓存。
+4. 缺失项判定基于覆盖后的有效值——三项都显式传入时无需配置环境变量。
 
 ### 2026-10-30 · 移除调用次数限制
 

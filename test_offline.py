@@ -51,6 +51,41 @@ def main() -> None:
     print(k1, k2, k3)
     assert k1 == k2 and k1 != k3
 
+    print("== connection overrides ==")
+    s.API_KEY, s.BASE_URL, s.MODEL = "env-key", "http://env/v1", "env-model"
+    assert s._effective_conn() == ("http://env/v1", "env-key", "env-model")
+    assert s._effective_conn(api_key="call-key") == (
+        "http://env/v1",
+        "call-key",
+        "env-model",
+    )
+    assert s._effective_conn(base_url="http://call/v1") == (
+        "http://call/v1",
+        "env-key",
+        "env-model",
+    )
+    assert s._effective_conn(model="call-model") == (
+        "http://env/v1",
+        "env-key",
+        "call-model",
+    )
+    # 空白字符串按"未传"处理，回落环境变量
+    assert s._effective_conn(api_key="  ") == ("http://env/v1", "env-key", "env-model")
+    # 覆盖项参与去重键：同一问题换模型/端点不得命中同一缓存
+    assert s._dedup_key(**kw, prior_consult_id="", model="call-model") != k1
+    assert (
+        s._dedup_key(**kw, prior_consult_id="", base_url="http://call/v1") != k1
+    )
+    # 参数齐全时不再要求环境变量
+    s.API_KEY, s.BASE_URL, s.MODEL = "", "", ""
+    assert s._missing_required_env() != []
+    assert (
+        s._missing_required_env(
+            api_key="k", base_url="http://localhost:1/v1", model="m"
+        )
+        == []
+    )
+
     print("== cache ttl ==")
     old = s.CACHE_DIR / "testttl_old.json"
     new = s.CACHE_DIR / "testttl_new.json"
@@ -129,7 +164,7 @@ def main() -> None:
     print("== consult end-to-end needs_evidence ==")
     captured: list[str] = []
 
-    async def fake_stream(prompt, ctx=None, on_partial=None, system_prompt=None):
+    async def fake_stream(prompt, ctx=None, on_partial=None, system_prompt=None, **kwargs):
         captured.append(prompt)
         result = s._StreamResult()
         result.answer_parts.append("现有结论\n【需要补充的信息】\n- 文件 A")
@@ -244,7 +279,7 @@ def main() -> None:
 
     print("== audit end-to-end ==")
 
-    async def fake_audit_stream(prompt, ctx=None, on_partial=None, system_prompt=None):
+    async def fake_audit_stream(prompt, ctx=None, on_partial=None, system_prompt=None, **kwargs):
         captured.append(prompt)
         result = s._StreamResult()
         result.answer_parts.append(
@@ -295,10 +330,15 @@ def main() -> None:
                 or {}
             )
             props = schema_obj.get("properties", {})
+            required = set(schema_obj.get("required", []))
             if name == "consult_expert":
                 assert "prior_consult_id" in props
             if name == "audit_artifact":
                 assert "checklist" in props and "prior_audit_id" in props
+            if name.startswith(("consult_expert", "audit_artifact")):
+                for opt in ("api_key", "base_url", "model"):
+                    assert opt in props, (name, opt)
+                    assert opt not in required, (name, opt)
 
     asyncio.run(schema())
     print("ALL OFFLINE TESTS PASS")
