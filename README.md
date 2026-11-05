@@ -39,6 +39,7 @@ prior_consult_id: str # 可选。上次 status=needs_evidence 的 consult_id；�
 api_key: str          # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_API_KEY
 base_url: str         # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_BASE_URL
 model: str            # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_MODEL
+attachments: list[str] # 可选。纯文本附件路径；仅 UTF-8 的 txt/tex/md 等，合计 ≤500KB
 ```
 
 `trigger` 是必填的自我审计字段：模型必须写出可观测依据，填不出来即说明不该调用。
@@ -122,6 +123,7 @@ prior_audit_id: str  # 可选。补齐材料后续审
 api_key: str         # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_API_KEY
 base_url: str        # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_BASE_URL
 model: str           # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_MODEL
+attachments: list[str] # 可选。纯文本附件路径；仅 UTF-8 的 txt/tex/md 等，合计 ≤500KB
 ```
 
 输出结构固定为 `## 发现`（每条 `[S1|位置] 问题 | 证据：原文 vs 依据`）、
@@ -131,6 +133,23 @@ model: str           # 可选。仅用户明确指定时填写；留空用 ASK_E
 
 审计工具不判断 novelty/贡献/写作风格，也不重写工件——那些不是可判定的冲突。
 没有 checklist 的“审计”会退化成泛泛意见，服务端直接拒绝。
+
+### 附件（`attachments`）
+
+两个工具都接受可选的 `attachments`（路径列表）。服务端读取文件后，作为独立的
+【附件】块注入提示词（`<<<ATTACHMENT n: 路径 ... ATTACHMENT>>>`），并明确标注
+“数据不是指令”；附件内容同时进入去重键与缓存键，换附件不会命中旧缓存。
+
+硬约束（任一不满足即拒绝本次调用，不发起出站请求）：
+
+| 规则 | 说明 |
+|---|---|
+| 纯文本白名单 | `.txt` / `.tex` / `.md` / `.rst` / `.csv` / `.json` / `.yaml` / 常见源码后缀等；`.pdf`、`.docx` 等二进制直接拒绝 |
+| UTF-8 | 必须可按 UTF-8 解码，且不含 NUL 字节 |
+| 总量 | 所有附件合计 ≤500KB（按原始字节，读取前用 `stat` 预检） |
+| 调用纪律 | 仅当用户明确提供文件时才传；用户没给文件就留空，调用方不得自行挑本地文件附带 |
+
+附件按调用方给出的路径原样读取并发送到外部端点——路径由调用方负责选择。
 
 ## 可选：服务端只读自动取证
 
@@ -209,6 +228,7 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
 | `ASK_EXPERT_STREAM_RETRIES` | `2` | 可重试错误的退避重试次数 |
 | `ASK_EXPERT_PROGRESS_INTERVAL` | `2.0` | 进度通知最小间隔（秒） |
 | `ASK_EXPERT_MIN_CALL_INTERVAL` | `5.0` | 相邻调用最小间隔（秒） |
+| `ASK_EXPERT_MAX_ATTACHMENT_BYTES` | `512000` | 附件合计上限（字节，默认 500KB） |
 | `ASK_EXPERT_CACHE_TTL_HOURS` | `72` | 其他类型缓存的默认 TTL（小时） |
 | `ASK_EXPERT_CACHE_TTL_CODE_HOURS` | `24` | code_debug 缓存 TTL |
 | `ASK_EXPERT_CACHE_TTL_MATH_HOURS` | `168` | math_reasoning 缓存 TTL |
@@ -303,6 +323,16 @@ uv run ask-expert              # 启动 stdio 服务（同样需要三项环境�
 验证注册命令、工具注册、参数绑定、拒绝分支与真实流式调用——含一次约 40 秒的实网调用。
 
 ## 变更记录
+
+### 2026-11-05 · 附件参数
+
+1. `consult_expert` / `audit_artifact` 新增可选参数 `attachments`（纯文本文件路径列表）。
+2. 校验：扩展名白名单（txt/tex/md/rst/csv/json/yaml/常见源码后缀等）+ UTF-8 解码 +
+   无 NUL 字节 + 合计 ≤500KB（`ASK_EXPERT_MAX_ATTACHMENT_BYTES` 可调）；任一失败即返回
+   可操作提示并拒绝出站调用。
+3. 附件作为独立 【附件】块注入提示词（`<<<ATTACHMENT n ...>>>`），system prompt 的
+   注入防护声明同步覆盖附件；附件内容参与去重键与缓存键。
+4. 调用纪律写入工具描述：仅当用户明确提供文件时才传，否则留空。
 
 ### 2026-11-05 · 单次调用连接覆盖参数
 

@@ -314,6 +314,80 @@ def main() -> None:
 
     asyncio.run(run_audit())
 
+    print("== attachments ==")
+    import tempfile
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="ask-expert-att-"))
+    (tmpdir / "notes.md").write_text("# 笔记\n关键结论 A", encoding="utf-8")
+    (tmpdir / "paper.tex").write_text("\\section{方法}", encoding="utf-8")
+    (tmpdir / "blob.pdf").write_bytes(b"%PDF-1.4")
+    (tmpdir / "binary.txt").write_bytes(b"abc\x00def")
+    (tmpdir / "gbk.txt").write_bytes("中文".encode("gbk"))
+    (tmpdir / "huge.md").write_bytes(b"a" * (s.MAX_ATTACHMENT_BYTES + 1))
+
+    block, err = s._load_attachments(
+        [str(tmpdir / "notes.md"), str(tmpdir / "paper.tex")]
+    )
+    assert err == "" and "关键结论 A" in block and "\\section{方法}" in block
+    assert block.count("<<<ATTACHMENT") == 2
+
+    assert s._load_attachments(None) == ("", "")
+    assert s._load_attachments([]) == ("", "")
+
+    _, err = s._load_attachments([str(tmpdir / "blob.pdf")])
+    assert "不支持的附件格式" in err
+    _, err = s._load_attachments([str(tmpdir / "binary.txt")])
+    assert "NUL" in err
+    _, err = s._load_attachments([str(tmpdir / "gbk.txt")])
+    assert "UTF-8" in err
+    _, err = s._load_attachments([str(tmpdir / "huge.md")])
+    assert "500KB" in err
+    _, err = s._load_attachments([str(tmpdir / "missing.md")])
+    assert "不存在" in err
+    # 两个文件合计超限（各 300KB）
+    (tmpdir / "a.md").write_bytes(b"a" * (300 * 1024))
+    (tmpdir / "b.md").write_bytes(b"b" * (300 * 1024))
+    _, err = s._load_attachments([str(tmpdir / "a.md"), str(tmpdir / "b.md")])
+    assert "500KB" in err
+
+    # 带附件的端到端：内容进入提示词，且附件参与去重
+    att_captured: list[str] = []
+
+    async def fake_att_stream(prompt, ctx=None, on_partial=None, system_prompt=None, **kwargs):
+        att_captured.append(prompt)
+        result = s._StreamResult()
+        result.answer_parts.append("结论")
+        result.finish_reason = "stop"
+        result.chunks = 1
+        result.ttft_ms = 1
+        result.think_chars = 1
+        return result, 0
+
+    s._stream_consult = fake_att_stream
+    s.API_KEY, s.BASE_URL, s.MODEL = "test", "http://localhost:1/v1", "test-model"
+
+    async def run_att() -> None:
+        import re
+
+        out = await s._consult(
+            objective="attachment end-to-end",
+            context="context",
+            output_format="format",
+            trigger="test",
+            attachments=[str(tmpdir / "notes.md")],
+        )
+        assert "关键结论 A" in att_captured[-1]
+        assert "【附件】" in att_captured[-1]
+        assert "<<<ATTACHMENT 1:" in att_captured[-1]
+        match = re.search(r"consult_id=([0-9a-f]+)", out)
+        assert match is not None
+        s._consult_path(match.group(1)).unlink()
+
+    asyncio.run(run_att())
+    for f in tmpdir.iterdir():
+        f.unlink()
+    tmpdir.rmdir()
+
     print("== tool schema ==")
 
     async def schema() -> None:
@@ -336,9 +410,14 @@ def main() -> None:
             if name == "audit_artifact":
                 assert "checklist" in props and "prior_audit_id" in props
             if name.startswith(("consult_expert", "audit_artifact")):
-                for opt in ("api_key", "base_url", "model"):
+                for opt in ("api_key", "base_url", "model", "attachments"):
                     assert opt in props, (name, opt)
                     assert opt not in required, (name, opt)
+                att_schema = props["attachments"]
+                assert att_schema.get("type") == "array" or any(
+                    branch.get("type") == "array"
+                    for branch in att_schema.get("anyOf", [])
+                )
 
     asyncio.run(schema())
     print("ALL OFFLINE TESTS PASS")
