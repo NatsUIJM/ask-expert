@@ -78,6 +78,8 @@ call = rpc(3, "tools/call", {
         "output_format": "一行等式给出结果，另起一行给出可回代检验的验算等式。",
         "trigger": "stdio 传输链路验证",
         "question_type": "math_reasoning",
+        # 本脚本验证同步链路本身，显式关闭后台模式。
+        "background": False,
     },
 }, )
 text = ""
@@ -109,6 +111,7 @@ stream_call = rpc(5, "tools/call", {
         "trigger": "stdio 传输层真实流式调用验证",
         "question_type": "code_debug",
         "attempts": "已尝试在 return 前打印 total，仍然报同样错误；Python 3.12，环境无第三方包。",
+        "background": False,
     },
 }, timeout=420.0)  # 流式长调用，需远大于默认 60s
 stext = ""

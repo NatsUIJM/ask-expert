@@ -25,6 +25,22 @@ A small MCP server that lets a weaker agent consult a bare frontier model (no to
 
 ## 工具
 
+### 异步任务（默认）
+
+专家调用通常要 40–250 秒。两个主工具默认**提交即返回**，不再让调用方干等：
+
+- `background=true`（默认）+ `wait_seconds=15`（默认）：任务在宽限期内完成就直接返回完整结果；
+  超时则返回 `[专家任务已提交 · task_id=...]`，后台继续执行。
+- 收到 `task_id` 后，用 `get_expert_task_status(task_id=..., wait_seconds=120)` 取结果。
+  长轮询会在任务完成时立即返回，不要用 1–5 秒反复短轮询。
+- `list_expert_tasks` 可找回忘记的 `task_id`。
+- 只有「本轮必须立刻拿到答案、愿意阻塞到完成」时才传 `background=false`。
+
+状态机：`queued → running → done / failed / cancelled`；服务重启后未完成任务标记为
+`interrupted`（执行体在 MCP 进程内，磁盘只存状态）。同时出站调用数由
+`ASK_EXPERT_MAX_CONCURRENCY` 限制（默认 3），超出的任务在信号量处排队。
+任务记录写在 `state/tasks/`，可随时删除（只影响 `list_expert_tasks` 的历史视图）。
+
 ### `consult_expert`
 
 ```
@@ -40,6 +56,8 @@ api_key: str          # 可选。仅用户明确指定时填写；留空用 ASK_
 base_url: str         # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_BASE_URL
 model: str            # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_MODEL
 attachments: list[str] # 可选。纯文本附件路径；仅 UTF-8 的 txt/tex/md 等，合计 ≤500KB
+background: bool      # 可选。默认 true：异步提交；false 表示阻塞到完成
+wait_seconds: float   # 可选。默认 15：宽限期内完成就直接返回结果，否则返回 task_id
 ```
 
 `trigger` 是必填的自我审计字段：模型必须写出可观测依据，填不出来即说明不该调用。
@@ -124,6 +142,8 @@ api_key: str         # 可选。仅用户明确指定时填写；留空用 ASK_E
 base_url: str        # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_BASE_URL
 model: str           # 可选。仅用户明确指定时填写；留空用 ASK_EXPERT_MODEL
 attachments: list[str] # 可选。纯文本附件路径；仅 UTF-8 的 txt/tex/md 等，合计 ≤500KB
+background: bool      # 可选。默认 true：异步提交；false 表示阻塞到完成
+wait_seconds: float   # 可选。默认 15：宽限期内完成就直接返回结果，否则返回 task_id
 ```
 
 输出结构固定为 `## 发现`（每条 `[S1|位置] 问题 | 证据：原文 vs 依据`）、
@@ -133,6 +153,28 @@ attachments: list[str] # 可选。纯文本附件路径；仅 UTF-8 的 txt/tex/
 
 审计工具不判断 novelty/贡献/写作风格，也不重写工件——那些不是可判定的冲突。
 没有 checklist 的“审计”会退化成泛泛意见，服务端直接拒绝。
+
+### `get_expert_task_status`
+
+```
+task_id: str          # 必填。主工具返回的 task_id（task_ab12cd34ef）
+wait_seconds: float   # 可选。长轮询上限，默认 0（立即返回）；建议传 120
+include_answer: bool  # 可选。完成时是否返回正文，默认 true
+```
+
+返回运行状态与已输出字数，或在任务完成时返回完整结果（含 `consult_id`/`audit_id`
+与处理要求）。`wait_seconds>0` 时任务一完成就返回，避免反复短轮询；单次上限由
+`ASK_EXPERT_MAX_STATUS_WAIT` 控制。服务重启后，磁盘上仍为运行态的任务会被标记为
+`interrupted`（执行体在 MCP 进程内，重启即丢失）。
+
+### `list_expert_tasks`
+
+```
+limit: int            # 可选。返回条数，默认 10，最大 50
+```
+
+列出最近提交的 `task_id` / 状态 / 模式 / 问题类型 / 创建时间 / 目标摘要，用于找回
+忘记的任务号。只读 `state/tasks/`，不发起模型调用。
 
 ### 附件（`attachments`）
 
@@ -197,6 +239,9 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
 **不设 `max_tokens`**：由模型自行决定输出长度。设上限会导致推理吃光预算、答案被截断为空
 （实测 `max_tokens=4096` 时一道证明题推理即耗尽 4096，答案 0 字）。
 
+**带 `reasoning_effort="max"`**：默认取最高推理强度（详见「配置 → 推理强度」）。
+不设输出上限与之配套——高档位会把更多 token 花在 `reasoning_content` 上。
+
 其它相关机制：
 - **进度通知**：经 `ctx.report_progress()` 每 2 秒至多一条（节流，避免通知风暴），客户端
   支持进度上报时可见输出在增长。通知失败不影响主流程。
@@ -223,11 +268,15 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
 | `ASK_EXPERT_BASE_URL` | 无（必填） | OpenAI 兼容端点，由调用处填写 |
 | `ASK_EXPERT_API_KEY` | 无（必填） | 缺失时工具返回可读提示，不抛错 |
 | `ASK_EXPERT_MODEL` | 无（必填） | 由调用处填写，填端点支持的任意模型 ID |
+| `ASK_EXPERT_REASONING_EFFORT` | `max` | 推理强度，见下节；**默认取模型支持的最高档** |
 | `ASK_EXPERT_TEMPERATURE` | `0.3` | 无实证依据的默认值 |
 | `ASK_EXPERT_TIMEOUT` | `600` | 单次请求超时（秒），覆盖最坏耗时 |
 | `ASK_EXPERT_STREAM_RETRIES` | `2` | 可重试错误的退避重试次数 |
 | `ASK_EXPERT_PROGRESS_INTERVAL` | `2.0` | 进度通知最小间隔（秒） |
 | `ASK_EXPERT_MIN_CALL_INTERVAL` | `5.0` | 相邻调用最小间隔（秒） |
+| `ASK_EXPERT_MAX_CONCURRENCY` | `3` | 同时进行的出站流式调用上限，超出排队 |
+| `ASK_EXPERT_DEFAULT_WAIT_SECONDS` | `15` | 主工具后台模式默认宽限（秒） |
+| `ASK_EXPERT_MAX_STATUS_WAIT` | `600` | 状态查询单次长轮询上限（秒） |
 | `ASK_EXPERT_MAX_ATTACHMENT_BYTES` | `512000` | 附件合计上限（字节，默认 500KB） |
 | `ASK_EXPERT_CACHE_TTL_HOURS` | `72` | 其他类型缓存的默认 TTL（小时） |
 | `ASK_EXPERT_CACHE_TTL_CODE_HOURS` | `24` | code_debug 缓存 TTL |
@@ -242,6 +291,24 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
 | `ASK_EXPERT_MAX_EVIDENCE_FILES` | `8` | 单次自动取证处理的请求数上限 |
 
 无 `MAX_TOKENS` 配置项——刻意不提供输出上限。
+
+### 推理强度（`ASK_EXPERT_REASONING_EFFORT`）
+
+出站请求默认带顶层 `reasoning_effort="max"`，即模型支持的最高推理强度。此前不传该参数，
+走模型默认档（`claude-opus-5-5` 为 `medium`），与「外部专家」的定位不符。
+
+- **可选值**：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`，
+  或**留空字符串**表示不传（回落模型默认）。非法值在服务启动时直接抛 `ValueError`。
+- **档位依据**：Anthropic 官方对 `claude-opus-5-5` 的 effort 定义为
+  `low < medium < high < xhigh < max`，`max` 是「最易触发思考且思考最深、不限制思考长度」；
+  原生协议字段为 `output_config.effort`，OpenAI 兼容协议为 `reasoning_effort`，由中转做协议转换。
+  `gpt-6-astra` 同样支持 `max`。
+- **协议兼容降级**：若端点/模型不认识该参数并返回 HTTP 400，服务端自动去掉参数重试一次，
+  记 `reasoning_effort_unsupported` 日志，且不消耗常规重试预算；换到旧模型不会让整个 MCP 报废。
+- **可观测**：`call_ok` 日志记录 `reasoning_effort` 字段（降级时为空串），便于日后按自有流量
+  标定档位与成本。
+- **缓存**：改动伴随 `PROMPT_VERSION` bump 到 `2026-11-09.1`，旧缓存（较低强度下的结果）
+  全部失效，不会命中旧答案。
 
 修改 `EXPERT_SYSTEM_PROMPT` 或 `TYPE_REQUIREMENTS` 后，必须同步 bump
 `server.py` 中的 `PROMPT_VERSION`；否则旧缓存仍会命中旧提示词的结果。
@@ -323,6 +390,37 @@ uv run ask-expert              # 启动 stdio 服务（同样需要三项环境�
 验证注册命令、工具注册、参数绑定、拒绝分支与真实流式调用——含一次约 40 秒的实网调用。
 
 ## 变更记录
+
+### 2026-11-09 · 异步任务（提交即返回 + 状态查询）
+
+1. `consult_expert` / `audit_artifact` 默认改为后台任务：新增 `background`（默认 true）
+   与 `wait_seconds`（默认 15）。宽限期内完成直接返回结果，否则返回 `task_id`。
+2. 新增 `get_expert_task_status`（支持长轮询）与 `list_expert_tasks`（找回任务号）。
+3. 任务状态原子落盘到 `state/tasks/<task_id>.json`（`queued/running/done/failed/
+   cancelled/interrupted`）；执行体在 MCP 进程内，服务重启后未完成任务标记为 interrupted。
+4. 新增 `ASK_EXPERT_MAX_CONCURRENCY`（默认 3）信号量限制同时出站调用；
+   `ASK_EXPERT_DEFAULT_WAIT_SECONDS`、`ASK_EXPERT_MAX_STATUS_WAIT` 可调。
+5. 运行中可从 `state/partial/<consult_id>.txt` 读取已输出字数（不返回半截正文，
+   避免调用方把半成品当结论）。
+6. 实网验证：真实 stdio 传输层提交 → 2 秒拿到 `task_id` → 长轮询 11 秒取回完整结果
+   （该次真实调用同时确认 `reasoning_effort="max"` 被端点接受，见下条更正）。
+7. `test_offline.py` 新增后台任务用例：提交/运行中/完成、未知与非法 task_id、
+   落盘与列表、宽限期直返、审计路径、工具 schema 默认值。
+
+### 2026-11-09 · 默认使用最高推理强度
+
+1. 出站请求新增顶层 `reasoning_effort="max"`（此前完全不传，走模型默认 `medium`）。
+   依据 Anthropic / OpenAI 官方档位定义：`claude-opus-5-5` 与 `gpt-6-astra` 的最高档均为 `max`。
+2. 新增 `ASK_EXPERT_REASONING_EFFORT` 环境变量，默认 `max`，白名单校验；留空表示不传。
+3. 兼容降级：端点返回 400 时去掉参数重试一次（记 `reasoning_effort_unsupported` 日志、
+   不消耗常规重试预算），换用不支持该参数的旧模型时 MCP 仍可用。
+4. `call_ok` 日志新增 `reasoning_effort` 字段；`PROMPT_VERSION` bump 到 `2026-11-09.1`
+   使旧强度下的缓存全部失效。
+5. `test_offline.py` 新增 4 组专项断言：默认值、请求体确实带 `max`、400 降级路径、
+   非法环境变量被拒。
+6. **实网验证已补齐（2026-11-09 晚）**：异步任务探测时额度已恢复，真实调用成功
+   （`claude-opus-5-5`，11 秒，`call_ok` 日志 `reasoning_effort=max`），确认端点接受该参数
+   且模型正常作答。此前的 429 是账号月额度耗尽，与参数无关。
 
 ### 2026-11-05 · 附件参数
 

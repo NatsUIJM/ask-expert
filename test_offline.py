@@ -7,12 +7,17 @@ consult 记录与 prior_consult_id 注入、工具 schema。
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ask_expert.server as s
+
+# 端到端用例会把 _stream_consult 换成假实现；推理强度专项用例需要真实实现。
+_REAL_STREAM_CONSULT = s._stream_consult
+_REAL_GET_CLIENT = s._get_client
 
 
 def main() -> None:
@@ -174,7 +179,7 @@ def main() -> None:
         result.think_chars = 10
         if on_partial is not None:
             on_partial(result.answer)
-        return result, 0
+        return result, 0, True
 
     s._stream_consult = fake_stream
     s.API_KEY, s.BASE_URL, s.MODEL = "test", "http://localhost:1/v1", "test-model"
@@ -290,7 +295,7 @@ def main() -> None:
         result.chunks = 1
         result.ttft_ms = 1
         result.think_chars = 10
-        return result, 0
+        return result, 0, True
 
     s._stream_consult = fake_audit_stream
     s.API_KEY, s.BASE_URL, s.MODEL = "test", "http://localhost:1/v1", "test-model"
@@ -361,7 +366,7 @@ def main() -> None:
         result.chunks = 1
         result.ttft_ms = 1
         result.think_chars = 1
-        return result, 0
+        return result, 0, True
 
     s._stream_consult = fake_att_stream
     s.API_KEY, s.BASE_URL, s.MODEL = "test", "http://localhost:1/v1", "test-model"
@@ -396,6 +401,7 @@ def main() -> None:
         names = {getattr(tool, "name", "") for tool in items}
         print("tools", names)
         assert "consult_expert" in names and "audit_artifact" in names
+        assert "get_expert_task_status" in names and "list_expert_tasks" in names
         for tool in items:
             name = getattr(tool, "name", "")
             schema_obj = (
@@ -420,6 +426,203 @@ def main() -> None:
                 )
 
     asyncio.run(schema())
+
+    print("== reasoning effort: 默认最高档 ==")
+    s._stream_consult = _REAL_STREAM_CONSULT
+    assert s.PROMPT_VERSION == "2026-11-09.1"
+    assert s.REASONING_EFFORT == "max", s.REASONING_EFFORT
+    assert "max" in s.ALLOWED_REASONING_EFFORTS
+    print("default:", s.REASONING_EFFORT, "| prompt_version:", s.PROMPT_VERSION)
+
+    print("== reasoning effort: 出站请求体确实带 max ==")
+    # 用假客户端捕获 _stream_consult 组装的 kwargs，不发网络请求。
+    seen: list[dict] = []
+
+    class _FakeCompletions:
+        async def create(self, **kwargs):
+            seen.append(kwargs)
+            payload = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="OK", reasoning_content=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+
+            class _OneShot:
+                def __aiter__(self):
+                    async def gen():
+                        yield payload
+
+                    return gen()
+
+            return _OneShot()
+
+    class _FakeClient:
+        chat = SimpleNamespace(completions=_FakeCompletions())
+
+    s._get_client = lambda **kwargs: _FakeClient()
+    s.MIN_CALL_INTERVAL = 0.0
+    result, retries, effort_applied = asyncio.run(
+        s._stream_consult("probe", api_key="k", base_url="http://x/v1", model="m")
+    )
+    assert seen and seen[0].get("reasoning_effort") == "max", seen
+    assert effort_applied is True and retries == 0
+    assert result.answer == "OK"
+    assert "max_tokens" not in seen[0] and "max_completion_tokens" not in seen[0]
+    print("request body reasoning_effort:", seen[0]["reasoning_effort"])
+
+    print("== reasoning effort: 端点 400 时降级一次、不消耗重试预算 ==")
+    from openai import APIStatusError
+
+    def _status_400():
+        return APIStatusError(
+            "unsupported parameter reasoning_effort",
+            response=SimpleNamespace(status_code=400, headers={}, request=None),
+            body=None,
+        )
+
+    class _RejectThenAccept:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if "reasoning_effort" in kwargs:
+                raise _status_400()
+            payload = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="fallback OK", reasoning_content=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+
+            class _OneShot:
+                def __aiter__(self):
+                    async def gen():
+                        yield payload
+
+                    return gen()
+
+            return _OneShot()
+
+    rejector = _RejectThenAccept()
+    s._get_client = lambda **kwargs: SimpleNamespace(
+        chat=SimpleNamespace(completions=rejector)
+    )
+    result2, retries2, effort_applied2 = asyncio.run(
+        s._stream_consult("probe2", api_key="k", base_url="http://x/v1", model="m")
+    )
+    assert len(rejector.calls) == 2, rejector.calls
+    assert "reasoning_effort" in rejector.calls[0]
+    assert "reasoning_effort" not in rejector.calls[1]
+    assert effort_applied2 is False and retries2 == 0
+    assert result2.answer == "fallback OK"
+    print("calls:", [sorted(c.keys()) for c in rejector.calls], "| retries:", retries2)
+
+    print("== reasoning effort: 环境变量非法值应被拒 ==")
+    import subprocess
+
+    bad = subprocess.run(
+        [sys.executable, "-c", "import ask_expert.server"],
+        env={**dict(os.environ), "ASK_EXPERT_REASONING_EFFORT": "ultra"},
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    assert bad.returncode != 0 and "ASK_EXPERT_REASONING_EFFORT" in bad.stderr
+    print("invalid env rejected:", bad.stderr.strip().splitlines()[-1][:120])
+
+    print("== background task: submit -> status -> result ==")
+    import re as _re
+
+    async def run_background_case() -> None:
+        gate = asyncio.Event()
+
+        async def fake_run_expert(**kwargs):
+            cid = kwargs.get("consult_id_override", "")
+            (s.PARTIAL_DIR / f"{cid}.txt").write_text("部分输出", encoding="utf-8")
+            await gate.wait()
+            try:
+                (s.PARTIAL_DIR / f"{cid}.txt").unlink()
+            except Exception:
+                pass
+            return (
+                f"[外部强模型咨询结果 · 测试 · consult_id={cid} · status=answered]\n答案正文"
+            )
+
+        s._run_expert = fake_run_expert
+        s.API_KEY, s.BASE_URL, s.MODEL = "k", "http://fake/v1", "fake-model"
+
+        # 1) wait_seconds=0：立即返回任务号
+        out = await s._consult(
+            objective="background task test", context="c", output_format="f",
+            trigger="t", background=True, wait_seconds=0,
+        )
+        assert "已提交" in out and "task_id=task_" in out, out
+        tid = _re.search(r"task_[0-9a-f]{10}", out).group(0)
+        await asyncio.sleep(0)  # 让 runner 真正开始
+
+        # 2) 运行中：状态 running，报告已输出字数
+        st = await s._get_task_status_text(tid, wait_seconds=0)
+        assert "状态 running" in st and "已输出约 4 字" in st, st
+        print("running status ok:", st.splitlines()[0])
+
+        # 3) 长轮询：任务完成后立即返回完整结果
+        gate.set()
+        st2 = await s._get_task_status_text(tid, wait_seconds=3)
+        assert "状态 done" in st2 and "答案正文" in st2, st2
+        print("done status ok:", st2.splitlines()[0])
+
+        # 4) 未知 / 非法 task_id：不报错、不穿越
+        assert "未找到任务" in await s._get_task_status_text("task_0000000000")
+        assert "未找到任务" in await s._get_task_status_text("../../etc/passwd")
+
+        # 5) 状态落盘 + 列表可找回
+        assert s._task_path(tid).exists()
+        assert tid in s._list_tasks_text()
+        print("persisted + listed:", tid)
+
+        # 6) 宽限期内完成：直接返回结果，不返回任务号
+        async def fake_fast(**kwargs):
+            return "[外部强模型咨询结果 · 测试 · consult_id=x · status=answered]\n即时答案"
+
+        s._run_expert = fake_fast
+        out2 = await s._consult(
+            objective="background fast test", context="c", output_format="f",
+            trigger="t", background=True, wait_seconds=3,
+        )
+        assert "即时答案" in out2 and "task_id=" not in out2, out2
+        print("inline grace ok")
+
+        # 7) 审计路径同样支持后台模式
+        out3 = await s._audit(
+            artifact="工件", checklist="S1 引用", background=True, wait_seconds=3,
+        )
+        assert "即时答案" in out3
+        print("audit background ok")
+
+        # 8) 默认参数确实是异步（工具 schema 默认值）
+        tools = await s.mcp.list_tools()
+        consult = next(t for t in tools if t.name == "consult_expert")
+        schema_obj = (
+            getattr(consult, "inputSchema", None)
+            or getattr(consult, "parameters", {})
+            or {}
+        )
+        props = schema_obj.get("properties", {})
+        assert props["background"].get("default") is True
+        assert props["wait_seconds"].get("default") == s.DEFAULT_WAIT_SECONDS
+        print("tool defaults ok:", props["background"].get("default"),
+              props["wait_seconds"].get("default"))
+
+    asyncio.run(run_background_case())
+
     print("ALL OFFLINE TESTS PASS")
 
 

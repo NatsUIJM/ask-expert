@@ -11,6 +11,10 @@
 出站调用一律走流式（stream=True）：整块请求在中转网关处会因长时间无响应而被判超时
 （502 Timed Out），SSE 心跳可避免。同时中转把大量 token 花在 reasoning_content 上，
 需要分别累计推理与答案 token，才能识别"推理吃光预算导致答案为空"这一失败模式。
+
+两个主工具默认异步：提交后最多等 wait_seconds（默认 15 秒），未完成则返回 task_id，
+由 get_expert_task_status 取结果、list_expert_tasks 找回任务号。任务状态原子落盘到
+state/tasks/，但执行体在本进程内——服务重启会丢失运行中的任务（标记 interrupted）。
 """
 
 from __future__ import annotations
@@ -106,6 +110,22 @@ def _missing_required_env(
     return [(name, desc) for name, desc in REQUIRED_ENV_VARS if not values[name]]
 
 
+# 推理强度：默认取模型支持的最高档 max。OpenAI 兼容协议用顶层 reasoning_effort
+# （Anthropic 原生协议为 output_config.effort，由中转做协议转换）。
+# claude-opus-5-5 的思考档位 low < medium < high < xhigh < max，默认 medium；
+# max 为「最易触发思考且思考最深、不限制思考长度」。gpt-6-astra 同样支持 max。
+# 留空字符串即不传该参数（回落模型默认），用于不支持推理强度的旧模型。
+ALLOWED_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+_reasoning_effort_raw = os.environ.get("ASK_EXPERT_REASONING_EFFORT", "max").strip().lower()
+if _reasoning_effort_raw and _reasoning_effort_raw not in ALLOWED_REASONING_EFFORTS:
+    raise ValueError(
+        f"ASK_EXPERT_REASONING_EFFORT 必须是以下之一（或留空表示不传）："
+        f"{', '.join(sorted(ALLOWED_REASONING_EFFORTS))}；收到 {_reasoning_effort_raw!r}"
+    )
+REASONING_EFFORT = _reasoning_effort_raw
+
 # 不设 max_tokens：由模型自行决定输出长度。设上限会导致中转侧把预算耗在推理上、
 # 答案 content 为空（实测 max_tokens=4096 时一道证明题推理即耗尽 4096）。
 TEMPERATURE = float(os.environ.get("ASK_EXPERT_TEMPERATURE", "0.3"))
@@ -116,6 +136,16 @@ PROGRESS_INTERVAL = float(os.environ.get("ASK_EXPERT_PROGRESS_INTERVAL", "2.0"))
 # 400 "Upstream rejected illegal short-input distillation or heartbeat probing"），
 # 限流是标准客户端礼仪，也避免把正常节奏误判为探测。
 MIN_CALL_INTERVAL = float(os.environ.get("ASK_EXPERT_MIN_CALL_INTERVAL", "5.0"))
+
+# 后台任务：主工具默认提交即返回，用 get_expert_task_status 取结果。
+# 同时进行的出站流式调用上限——过多并发会触发中转侧限流/反探测守卫，
+# 也会更快烧完额度；默认 3 路，排队中的任务状态仍为 running。
+MAX_CONCURRENCY = max(1, int(os.environ.get("ASK_EXPERT_MAX_CONCURRENCY", "3")))
+# 状态查询单次长轮询上限（秒），防止调用方传一个过大值把工具调用挂住。
+MAX_STATUS_WAIT = float(os.environ.get("ASK_EXPERT_MAX_STATUS_WAIT", "600"))
+# 主工具默认的同步宽限：任务在这么多秒内完成就直接返回结果，否则返回任务号。
+# 短咨询仍是一次调用拿到答案，长咨询不再阻塞调用方。
+DEFAULT_WAIT_SECONDS = float(os.environ.get("ASK_EXPERT_DEFAULT_WAIT_SECONDS", "15"))
 
 # 审计模式的工件上限（字符）。超过则拒绝，避免把超长材料塞进单次咨询导致
 # 推理耗尽或跨节一致性丢失；要求调用方按章节拆分并分别声明 scope。
@@ -159,7 +189,9 @@ MAX_EVIDENCE_FILES = int(os.environ.get("ASK_EXPERT_MAX_EVIDENCE_FILES", "8"))
 # （file/grep/diff）、可选服务端只读自动取证、工件注入防护。
 # 2026-10-29.1：连接三项改由调用处环境变量注入；缓存键加入 BASE_URL，
 # 避免同一模型名在不同端点之间串用缓存。
-PROMPT_VERSION = "2026-10-29.1"
+# 2026-11-09.1：出站请求默认带 reasoning_effort="max"（此前不传、走模型默认
+# medium），旧缓存是较低推理强度下的结果，必须全部失效。
+PROMPT_VERSION = "2026-11-09.1"
 # 专家答不了时，用这个固定小节标题声明缺少什么；服务端据此返回 needs_evidence
 NEEDS_EVIDENCE_MARKER = "【需要补充的信息】"
 
@@ -178,6 +210,8 @@ RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 _rate_lock = asyncio.Lock()
 _last_call_at = 0.0
+# 限制同时进行的流式调用数；排队中的请求在信号量处等待，不占连接。
+_consult_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
 
 async def _respect_rate_limit() -> None:
@@ -1145,19 +1179,24 @@ async def _stream_consult(
     api_key: str = "",
     base_url: str = "",
     model: str = "",
-) -> tuple[_StreamResult, int]:
+) -> tuple[_StreamResult, int, bool]:
     """发起流式调用并累计结果。对可重试错误做有限次退避重试。
 
     system_prompt 为空时使用咨询模式的默认人设；审计模式传入审计员人设。
     api_key/base_url/model 为空时用环境变量配置，非空时覆盖。
-    返回 (结果, 实际重试次数)。
+    返回 (结果, 实际重试次数, 本次是否成功带上了 reasoning_effort)。
+    第三项用于日志标定：端点不认识该参数时会降级为不带参数。
     """
     resolved_url, resolved_key, resolved_model = _effective_conn(
         api_key=api_key, base_url=base_url, model=model
     )
     client = _get_client(base_url=resolved_url, api_key=resolved_key)
     last_exc: Exception | None = None
-    for attempt in range(STREAM_RETRIES + 1):
+    # 部分端点/模型不认识 reasoning_effort，会返回 400。此时只降级一次：
+    # 去掉该参数重试，保证换模型后 MCP 仍可用；降级记入日志供排查。
+    effort_enabled = bool(REASONING_EFFORT)
+    attempt = 0
+    while attempt <= STREAM_RETRIES:
         # 节流进度通知：每 PROGRESS_INTERVAL 秒至多一条，避免通知风暴
         state = {"last": 0.0}
 
@@ -1183,28 +1222,51 @@ async def _stream_consult(
         try:
             await _respect_rate_limit()
             request_started = time.monotonic()
-            stream = await client.chat.completions.create(
-                model=resolved_model,
-                messages=[
+            # 不传 max_tokens / max_completion_tokens：由模型自行决定输出长度
+            request_kwargs: dict[str, Any] = {
+                "model": resolved_model,
+                "messages": [
                     {"role": "system", "content": system_prompt or EXPERT_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
-                # 不传 max_tokens / max_completion_tokens：由模型自行决定输出长度
-                temperature=TEMPERATURE,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
-            result = await _consume_stream(
-                stream,
-                _StreamResult(),
-                on_delta,
-                started=request_started,
-                on_partial=on_partial,
-            )
+                "temperature": TEMPERATURE,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            if effort_enabled:
+                request_kwargs["reasoning_effort"] = REASONING_EFFORT
+            # 同时出站调用数受限；排队时不占连接，也不阻塞事件循环。
+            async with _consult_semaphore:
+                stream = await client.chat.completions.create(**request_kwargs)
+                result = await _consume_stream(
+                    stream,
+                    _StreamResult(),
+                    on_delta,
+                    started=request_started,
+                    on_partial=on_partial,
+                )
             if result.chunks == 0:
                 raise APIConnectionError(request=None)  # 空流视同传输失败，进入重试
-            return result, attempt
+            return result, attempt, effort_enabled
         except Exception as exc:  # noqa: BLE001
+            # 400 通常是不重试的语义错误，但「端点不认识 reasoning_effort」是一个
+            # 例外：去掉参数重试一次，且不计入常规重试预算（避免白耗掉重试次数）。
+            # effort_enabled 置 False 后本分支最多进入一次，不会形成死循环。
+            if (
+                effort_enabled
+                and isinstance(exc, APIStatusError)
+                and exc.status_code == 400
+            ):
+                effort_enabled = False
+                _log(
+                    {
+                        "event": "reasoning_effort_unsupported",
+                        "effort": REASONING_EFFORT,
+                        "model": resolved_model,
+                        "error": f"{type(exc).__name__}: {exc}"[:300],
+                    }
+                )
+                continue
             if not _is_retryable(exc) or attempt >= STREAM_RETRIES:
                 raise
             last_exc = exc
@@ -1217,6 +1279,7 @@ async def _stream_consult(
                 }
             )
             await asyncio.sleep(1.5 * (attempt + 1))
+            attempt += 1
     raise last_exc if last_exc else RuntimeError("unreachable")
 
 
@@ -1244,6 +1307,7 @@ async def _run_expert(
     base_url: str = "",
     model: str = "",
     attachments: list[str] | str | None = None,
+    consult_id_override: str = "",
 ) -> str:
     is_audit = mode == "audit"
     prior_id = prior_audit_id if is_audit else prior_consult_id
@@ -1379,7 +1443,7 @@ async def _run_expert(
             ),
         )
 
-    consult_id = _new_consult_id()
+    consult_id = consult_id_override or _new_consult_id()
     prior = _prior_block(prior_id)
     if prior_id and not prior:
         _log(
@@ -1417,7 +1481,7 @@ async def _run_expert(
     saver = _PartialSaver(consult_id)
     started = time.monotonic()
     try:
-        stream_result, retries = await _stream_consult(
+        stream_result, retries, effort_applied = await _stream_consult(
             prompt,
             ctx,
             saver.update,
@@ -1519,6 +1583,7 @@ async def _run_expert(
             "prompt_version": PROMPT_VERSION,
             "model": resolved_model,
             "base_url": resolved_url,
+            "reasoning_effort": REASONING_EFFORT if effort_applied else "",
             "prior_consult_id": prior_id,
             "usage": stream_result.usage,
         }
@@ -1714,8 +1779,10 @@ async def _consult(
     model: str = "",
     attachments: list[str] | str | None = None,
     ctx: "Context | None" = None,
+    background: bool = False,
+    wait_seconds: float = 0.0,
 ) -> str:
-    return await _run_expert(
+    run_kwargs = dict(
         mode="consult",
         objective=objective,
         context=context,
@@ -1729,8 +1796,21 @@ async def _consult(
         base_url=base_url,
         model=model,
         attachments=attachments,
-        ctx=ctx,
     )
+    if background:
+        resolved_url, _, resolved_model = _effective_conn(
+            api_key=api_key, base_url=base_url, model=model
+        )
+        return await _start_background(
+            mode="consult",
+            run_kwargs=run_kwargs,
+            question_type=question_type,
+            objective_preview=objective,
+            model=resolved_model,
+            base_url=resolved_url,
+            wait_seconds=wait_seconds,
+        )
+    return await _run_expert(**run_kwargs, ctx=ctx)
 
 
 async def _audit(
@@ -1746,8 +1826,10 @@ async def _audit(
     model: str = "",
     attachments: list[str] | str | None = None,
     ctx: "Context | None" = None,
+    background: bool = False,
+    wait_seconds: float = 0.0,
 ) -> str:
-    return await _run_expert(
+    run_kwargs = dict(
         mode="audit",
         objective=artifact_name or "audit",
         artifact=artifact,
@@ -1760,8 +1842,288 @@ async def _audit(
         base_url=base_url,
         model=model,
         attachments=attachments,
-        ctx=ctx,
     )
+    if background:
+        resolved_url, _, resolved_model = _effective_conn(
+            api_key=api_key, base_url=base_url, model=model
+        )
+        return await _start_background(
+            mode="audit",
+            run_kwargs=run_kwargs,
+            question_type="audit",
+            objective_preview=artifact_name or "audit",
+            model=resolved_model,
+            base_url=resolved_url,
+            wait_seconds=wait_seconds,
+        )
+    return await _run_expert(**run_kwargs, ctx=ctx)
+
+
+# ------------------------------------------------------------- 后台任务（异步）
+
+TASK_DIR = STATE_DIR / "tasks"
+TASK_DIR.mkdir(parents=True, exist_ok=True)
+
+# 进程内登记：task_id -> {"record": dict, "asyncio_task": Task | None}
+# 磁盘上的 state/tasks/<task_id>.json 是唯一权威状态（服务重启后据此判定 interrupted）。
+_tasks: dict[str, dict[str, Any]] = {}
+_TASK_ID_RE = re.compile(r"^task_[0-9a-f]{10}$")
+_TASK_TERMINAL = frozenset({"done", "failed", "cancelled", "interrupted"})
+
+
+def _new_task_id() -> str:
+    return "task_" + uuid.uuid4().hex[:10]
+
+
+def _task_path(task_id: str) -> Path:
+    return TASK_DIR / f"{task_id}.json"
+
+
+def _task_write(record: dict[str, Any]) -> None:
+    """原子落盘：先写 .tmp 再 replace，避免状态查询读到半截 JSON。"""
+    record["updated_at"] = _now_iso()
+    path = _task_path(record["task_id"])
+    try:
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def _task_read(task_id: str) -> dict[str, Any] | None:
+    if not _TASK_ID_RE.match(task_id or ""):
+        return None  # 同时挡住路径穿越
+    path = _task_path(task_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _task_elapsed_seconds(record: dict[str, Any]) -> float:
+    start = _parse_iso(record.get("started_at") or record.get("created_at"))
+    if start is None:
+        return 0.0
+    end = _parse_iso(record.get("finished_at")) if record.get("finished_at") else None
+    if end is None:
+        end = datetime.now(timezone.utc).astimezone()
+    return max(0.0, (end - start).total_seconds())
+
+
+def _task_partial_chars(record: dict[str, Any]) -> int:
+    """运行中可看到的已输出字数：读 _PartialSaver 写的部分结果文件。"""
+    consult_id = str(record.get("consult_id") or "")
+    if not consult_id:
+        return 0
+    try:
+        return len((PARTIAL_DIR / f"{consult_id}.txt").read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+
+
+def _task_submit_text(record: dict[str, Any]) -> str:
+    """提交后的返回：已完成就直接给结果，未完成给任务号与取法。"""
+    status = record.get("status")
+    task_id = record.get("task_id")
+    if status == "done":
+        return str(record.get("result", ""))
+    if status == "failed":
+        return (
+            f"[专家任务失败 · {task_id} · {record.get('mode','')}] "
+            f"{record.get('error','')}\n"
+            "修正输入后可重新提交；也可用 get_expert_task_status 复查。"
+        )
+    if status == "cancelled":
+        return f"[专家任务已取消 · {task_id}]"
+    elapsed = _task_elapsed_seconds(record)
+    partial = _task_partial_chars(record)
+    return (
+        f"[专家任务已提交 · task_id={task_id} · 状态 {status}]\n"
+        f"模式：{record.get('mode')}｜问题类型：{record.get('question_type')}｜"
+        f"模型：{record.get('model')}\n"
+        f"已运行 {elapsed:.0f} 秒，已输出约 {partial} 字。"
+        "后台任务会继续执行，当前调用不必等待。\n"
+        f"取结果：get_expert_task_status(task_id=\"{task_id}\", wait_seconds=120)"
+        "——wait_seconds>0 时任务一完成就返回，避免反复短轮询。\n"
+        "注意：任务随 MCP 服务进程存活；服务重启后该任务标记为 interrupted，需要重新提交。"
+    )
+
+
+def _task_status_text(record: dict[str, Any], include_answer: bool = True) -> str:
+    status = record.get("status", "?")
+    elapsed = _task_elapsed_seconds(record)
+    head = f"[专家任务 {record.get('task_id')} · 状态 {status} · 耗时 {elapsed:.0f} 秒]"
+    if status == "done":
+        body = record.get("result", "") if include_answer else (
+            "（include_answer=false，未返回正文；重新查询时传 include_answer=true）"
+        )
+        return head + "\n" + body
+    if status == "failed":
+        return head + "\n错误：" + str(record.get("error", "")) + "\n修正后请重新提交。"
+    if status == "interrupted":
+        return head + "\n原任务已随 MCP 服务重启丢失，请重新提交同一请求。"
+    if status == "cancelled":
+        return head + "\n任务已取消。"
+    partial = _task_partial_chars(record)
+    return (
+        head + f"\n仍在运行，已输出约 {partial} 字。"
+        "稍后再查，或带 wait_seconds 长轮询（如 wait_seconds=120）。"
+    )
+
+
+async def _start_background(
+    *,
+    mode: str,
+    run_kwargs: dict[str, Any],
+    question_type: str,
+    objective_preview: str,
+    model: str,
+    base_url: str,
+    wait_seconds: float,
+) -> str:
+    """提交后台任务并按宽限期决定「直接返回结果」还是「返回任务号」。"""
+    task_id = _new_task_id()
+    consult_id = _new_consult_id()
+    record: dict[str, Any] = {
+        "task_id": task_id,
+        "consult_id": consult_id,
+        "mode": mode,
+        "question_type": question_type,
+        "status": "queued",
+        "created_at": _now_iso(),
+        "started_at": None,
+        "finished_at": None,
+        "objective_preview": str(objective_preview)[:200],
+        "model": model,
+        "base_url": base_url,
+        "result": "",
+        "error": "",
+    }
+    _task_write(record)
+    holder: dict[str, Any] = {"record": record, "asyncio_task": None}
+    _tasks[task_id] = holder
+
+    async def runner() -> None:
+        record["status"] = "running"
+        record["started_at"] = _now_iso()
+        _task_write(record)
+        try:
+            # ctx=None：工具调用返回后，原请求的进度通知通道已失效，不能在后台用。
+            result = await _run_expert(
+                **run_kwargs, consult_id_override=consult_id, ctx=None
+            )
+            record["result"] = result
+            record["status"] = "done"
+        except asyncio.CancelledError:
+            record["status"] = "cancelled"
+            raise
+        except Exception as exc:  # noqa: BLE001
+            record["status"] = "failed"
+            record["error"] = f"{type(exc).__name__}: {exc}"[:800]
+            _log(
+                {
+                    "event": "background_task_failed",
+                    "task_id": task_id,
+                    "error": record["error"][:300],
+                }
+            )
+        finally:
+            record["finished_at"] = _now_iso()
+            _task_write(record)
+            holder["asyncio_task"] = None
+            # 已到终态的任务从内存移除（磁盘仍是权威）；避免长跑进程里结果越积越多。
+            if record["status"] in _TASK_TERMINAL:
+                _tasks.pop(task_id, None)
+
+    task = asyncio.create_task(runner())
+    holder["asyncio_task"] = task
+
+    if wait_seconds and wait_seconds > 0:
+        try:
+            # shield：宽限到期只停止等待，不取消后台任务。
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=min(wait_seconds, MAX_STATUS_WAIT)
+            )
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass  # 失败已记入 record，由 _task_submit_text 呈现
+    return _task_submit_text(record)
+
+
+async def _get_task_status_text(
+    task_id: str, wait_seconds: float = 0.0, include_answer: bool = True
+) -> str:
+    task_id = (task_id or "").strip()
+    live = _tasks.get(task_id)
+    if live is not None and wait_seconds and wait_seconds > 0:
+        task = live.get("asyncio_task")
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=min(wait_seconds, MAX_STATUS_WAIT)
+                )
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+    record = live["record"] if live is not None else _task_read(task_id)
+    if record is None:
+        return (
+            f"[未找到任务] {task_id or '(空)'}。"
+            "请检查 task_id；可用 list_expert_tasks 查看最近提交的任务。"
+        )
+    if live is None and record.get("status") not in _TASK_TERMINAL:
+        # 内存无登记、磁盘仍是运行态：只可能是服务重启过。
+        record["status"] = "interrupted"
+        record["error"] = "MCP 服务进程已重启，原后台任务不再运行。"
+        record["finished_at"] = _now_iso()
+        _task_write(record)
+    return _task_status_text(record, include_answer=include_answer)
+
+
+def _list_tasks_text(limit: int = 10) -> str:
+    items: list[dict[str, Any]] = []
+    for path in TASK_DIR.glob("task_*.json"):
+        try:
+            items.append(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    items.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
+    try:
+        limit = max(1, min(int(limit), 50))
+    except Exception:
+        limit = 10
+    items = items[:limit]
+    if not items:
+        return "[专家任务] 暂无后台任务记录。"
+    lines = [f"[专家任务列表 · 最近 {len(items)} 条]"]
+    for r in items:
+        lines.append(
+            f"- {r.get('task_id')} · {r.get('status')} · {r.get('mode')} · "
+            f"{r.get('question_type')} · {r.get('created_at','?')} · "
+            f"{str(r.get('objective_preview',''))[:50]}"
+        )
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -1780,6 +2142,8 @@ async def consult_expert(
     base_url: str = "",
     model: str = "",
     attachments: list[str] | None = None,
+    background: bool = True,
+    wait_seconds: float = DEFAULT_WAIT_SECONDS,
     ctx: Context = None,
 ) -> str:
     """向一个顶级推理模型咨询单个自包含问题，返回文本答案。
@@ -1808,6 +2172,13 @@ async def consult_expert(
 
 【拆问规则】可以把一个大问题拆成若干个各自完整的小问题分别咨询；
 但禁止把同一个问题的规格分多次挤出去——碎片化交付会显著降低回答质量。
+
+【异步（默认）】专家调用通常要 40–250 秒，默认不在调用里干等：
+- 若任务在 wait_seconds（默认 15 秒）内完成，直接返回完整结果（短问题一次拿到答案）；
+- 否则返回 `[专家任务已提交 · task_id=...]`，后台继续执行。**收到任务号不要丢弃**，
+  之后在方便时调用 `get_expert_task_status(task_id=..., wait_seconds=120)` 取结果：
+  wait_seconds>0 会在任务完成时立即返回，避免反复短轮询。也可用 `list_expert_tasks`
+  找回最近的任务号。任务随 MCP 服务进程存活，服务重启后会标记为 interrupted，需重新提交。
 
 【返回值】返回含 consult_id 与 status。status=needs_evidence 时，按返回的
 【需要补充的信息】补齐材料，再用 prior_consult_id 续问；status=partial 表示上游中断、
@@ -1856,6 +2227,11 @@ Args:
         .txt/.tex/.md/.rst/.csv/.json/.yaml 及常见源码后缀等纯文本文件（须为 UTF-8、
         无 NUL 字节），所有附件合计不超过 500KB。仅在用户明确提供这些文件、且需要专家
         基于其内容作答时填写；用户没有提供文件时留空（不传），不要自行挑选本地文件附带。
+    background: 默认 true（异步）：到 wait_seconds 仍未完成就返回 task_id，稍后用
+        get_expert_task_status 取结果。只有「本轮必须立刻拿到答案、且愿意阻塞到完成」
+        时才传 false。
+    wait_seconds: 后台模式下，调用内同步等待的宽限秒数（默认 15）。期间完成就直接返回
+        完整结果；超时返回任务号。传 0 表示立即返回任务号。
     """
     return await _consult(
         objective=objective,
@@ -1871,6 +2247,8 @@ Args:
         model=model,
         attachments=attachments,
         ctx=ctx,
+        background=background,
+        wait_seconds=wait_seconds,
     )
 
 
@@ -1886,6 +2264,8 @@ async def audit_artifact(
     base_url: str = "",
     model: str = "",
     attachments: list[str] | None = None,
+    background: bool = True,
+    wait_seconds: float = DEFAULT_WAIT_SECONDS,
     ctx: Context = None,
 ) -> str:
     """依据给定审计标准，对既成工件做证据核对的审计（与 consult_expert 的咨询模式不同）。
@@ -1896,6 +2276,10 @@ async def audit_artifact(
 判断 novelty/贡献大小/品味、开放式“帮我看看” → 本工具不会给有效结果，应改用咨询或人工。
 【关键区别】咨询输出是建议/方向，无法离线校准；审计输出是可定位、可引用双方证据的缺陷清单，
 可对已知错误测召回与误报。没有 checklist 的“审计”会退化成泛泛意见，服务端会直接拒绝。
+
+【异步（默认）】与 consult_expert 相同：wait_seconds（默认 15 秒）内完成就直接返回结果，
+否则返回 `task_id`，之后用 `get_expert_task_status(task_id=..., wait_seconds=120)` 取结果；
+`list_expert_tasks` 可找回最近的任务号。任务随 MCP 服务进程存活，服务重启后标记为 interrupted。
 
 【工作方式】专家无工具、无状态，只读你提供的工件与证据。它会在回答中列出：
 - 发现：`[S1|位置] 问题 | 证据：工件原文 vs 依据/计算值`
@@ -1937,6 +2321,9 @@ Args:
         随工件一起交给审计员。仅接受 .txt/.tex/.md/.rst/.csv/.json/.yaml 及常见源码后缀等
         纯文本文件（须为 UTF-8、无 NUL 字节），所有附件合计不超过 500KB。仅在用户明确提供
         这些文件、且需要审计员核对其内容时填写；用户没有提供文件时留空（不传）。
+    background: 默认 true（异步）：到 wait_seconds 仍未完成就返回 task_id，稍后用
+        get_expert_task_status 取结果。只有本轮必须立刻拿到审计结论时才传 false。
+    wait_seconds: 后台模式下调用内同步等待的宽限秒数（默认 15）；期间完成直接返回结果。
     """
     return await _audit(
         artifact=artifact,
@@ -1950,7 +2337,51 @@ Args:
         model=model,
         attachments=attachments,
         ctx=ctx,
+        background=background,
+        wait_seconds=wait_seconds,
     )
+
+
+@mcp.tool()
+async def get_expert_task_status(
+    task_id: str,
+    wait_seconds: float = 0.0,
+    include_answer: bool = True,
+) -> str:
+    """查询 ask-expert 后台任务的进度或结果（配合 consult_expert / audit_artifact 的异步模式）。
+
+【何时用】任一主工具返回 `[专家任务已提交 · task_id=...]` 后；或上下文被压缩、忘了任务号时
+先用 list_expert_tasks 找回。
+
+【怎么用】任务未完成时返回运行状态与已输出字数；完成时返回完整结果（含 consult_id/audit_id
+与处理要求）。wait_seconds>0 表示长轮询：任务在这段时间内完成就立刻返回，不必反复短查询；
+建议传 120 而不是 1–5 秒。单次等待上限由 ASK_EXPERT_MAX_STATUS_WAIT 控制（默认 600 秒）。
+
+【注意】任务明细落盘在服务端 state/tasks/，但**执行体在 MCP 进程内**：服务重启后未完成任务
+会标记为 interrupted，需要重新提交同一请求。include_answer=false 只返回状态、不返回正文，
+用于只要确认是否完成、不重复占用上下文的场景。
+
+Args:
+    task_id: 主工具返回的 task_id（形如 task_ab12cd34ef）。
+    wait_seconds: 长轮询最多等待秒数，默认 0（立即返回当前状态）。
+    include_answer: 完成时是否返回完整结果正文，默认 true。
+    """
+    return await _get_task_status_text(
+        task_id, wait_seconds=wait_seconds, include_answer=include_answer
+    )
+
+
+@mcp.tool()
+async def list_expert_tasks(limit: int = 10) -> str:
+    """列出最近提交的专家后台任务（task_id / 状态 / 模式 / 创建时间 / 目标摘要）。
+
+用于找回忘记的 task_id，或确认是否有任务仍在运行。只读 state/tasks/ 下的落盘记录，
+不发起任何模型调用。limit 最大 50。
+
+Args:
+    limit: 返回条数上限，默认 10。
+    """
+    return _list_tasks_text(limit)
 
 
 def main() -> None:
