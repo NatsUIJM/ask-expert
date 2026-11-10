@@ -236,11 +236,12 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
 `finish_reason=length` 且答案为空时明确报「咨询未产出答案：推理耗尽服务端允许的输出长度」，
 而不是含糊地说"返回空内容"。
 
-**不设 `max_tokens`**：由模型自行决定输出长度。设上限会导致推理吃光预算、答案被截断为空
-（实测 `max_tokens=4096` 时一道证明题推理即耗尽 4096，答案 0 字）。
+**不设 `max_tokens`**：实测中转在两种协议下都忽略该参数，输出预算由服务端固定
+（详见「推理强度与输出预算」）。
 
-**带 `reasoning_effort="max"`**：默认取最高推理强度（详见「配置 → 推理强度」）。
-不设输出上限与之配套——高档位会把更多 token 花在 `reasoning_content` 上。
+**带 `reasoning_effort="high"`**：不取 `max` / `xhigh`——实测 `max` 会让复杂问题把
+固定的输出预算全部耗在推理上、正文为 0 字，`xhigh` 表现同样不佳。可用
+`ASK_EXPERT_REASONING_EFFORT` 覆盖，留空表示不传。
 
 其它相关机制：
 - **进度通知**：经 `ctx.report_progress()` 每 2 秒至多一条（节流，避免通知风暴），客户端
@@ -268,7 +269,7 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
 | `ASK_EXPERT_BASE_URL` | 无（必填） | OpenAI 兼容端点，由调用处填写 |
 | `ASK_EXPERT_API_KEY` | 无（必填） | 缺失时工具返回可读提示，不抛错 |
 | `ASK_EXPERT_MODEL` | 无（必填） | 由调用处填写，填端点支持的任意模型 ID |
-| `ASK_EXPERT_REASONING_EFFORT` | `max` | 推理强度，见下节；**默认取模型支持的最高档** |
+| `ASK_EXPERT_REASONING_EFFORT` | `high` | 推理强度；留空表示不传（回落模型默认） |
 | `ASK_EXPERT_TEMPERATURE` | `0.3` | 无实证依据的默认值 |
 | `ASK_EXPERT_TIMEOUT` | `600` | 单次请求超时（秒），覆盖最坏耗时 |
 | `ASK_EXPERT_STREAM_RETRIES` | `2` | 可重试错误的退避重试次数 |
@@ -292,23 +293,23 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
 
 无 `MAX_TOKENS` 配置项——刻意不提供输出上限。
 
-### 推理强度（`ASK_EXPERT_REASONING_EFFORT`）
+### 推理强度与输出预算（实测）
 
-出站请求默认带顶层 `reasoning_effort="max"`，即模型支持的最高推理强度。此前不传该参数，
-走模型默认档（`claude-opus-5-5` 为 `medium`），与「外部专家」的定位不符。
+默认 `reasoning_effort="high"`。可用 `ASK_EXPERT_REASONING_EFFORT` 改成
+`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`，或留空表示不传。
 
-- **可选值**：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`，
-  或**留空字符串**表示不传（回落模型默认）。非法值在服务启动时直接抛 `ValueError`。
-- **档位依据**：Anthropic 官方对 `claude-opus-5-5` 的 effort 定义为
-  `low < medium < high < xhigh < max`，`max` 是「最易触发思考且思考最深、不限制思考长度」；
-  原生协议字段为 `output_config.effort`，OpenAI 兼容协议为 `reasoning_effort`，由中转做协议转换。
-  `gpt-6-astra` 同样支持 `max`。
-- **协议兼容降级**：若端点/模型不认识该参数并返回 HTTP 400，服务端自动去掉参数重试一次，
-  记 `reasoning_effort_unsupported` 日志，且不消耗常规重试预算；换到旧模型不会让整个 MCP 报废。
-- **可观测**：`call_ok` 日志记录 `reasoning_effort` 字段（降级时为空串），便于日后按自有流量
-  标定档位与成本。
-- **缓存**：改动伴随 `PROMPT_VERSION` bump 到 `2026-11-09.1`，旧缓存（较低强度下的结果）
-  全部失效，不会命中旧答案。
+不取 `max` / `xhigh` 的原因（2026-11-09/10 实测，`api.lmuai.ai`）：
+
+- OpenAI 兼容协议下 `max_tokens` / `max_completion_tokens` 被忽略
+  （设 64，实际输出 384 tokens，`finish_reason=stop`）。
+- Anthropic 原生 `/v1/messages` 下 `max_tokens` 同样被忽略
+  （设 64，实际输出 417 tokens，`stop_reason=end_turn`）。
+- 一次复杂咨询在 `completion_tokens=28826` 处返回 `finish_reason=length`、正文 0 字
+  （推理 73,690 字）。
+
+即**输出预算由中转/订阅固定，客户端无法调大**。`max` 会让复杂问题把预算全部耗在内部
+推理上；`xhigh` 实测同样表现不佳，故退到 `high`。若仍出现 `finish_reason=length`，
+可靠解法是缩小单次任务（拆分问题或工件），而不是继续调参数。
 
 修改 `EXPERT_SYSTEM_PROMPT` 或 `TYPE_REQUIREMENTS` 后，必须同步 bump
 `server.py` 中的 `PROMPT_VERSION`；否则旧缓存仍会命中旧提示词的结果。
@@ -391,6 +392,32 @@ uv run ask-expert              # 启动 stdio 服务（同样需要三项环境�
 
 ## 变更记录
 
+### 2026-11-10 · 推理强度退到 high
+
+1. 出站请求带 `reasoning_effort="high"`（此前为 `xhigh`，更早为 `max`）。
+2. 原因：`max` 在固定输出预算下会让复杂问题正文为 0 字；`xhigh` 实测同样表现不佳。
+3. `PROMPT_VERSION` 升至 `2026-11-10.2`，不同强度档位的缓存不混用。
+4. `test_offline.py` 断言请求体带 `high` 且不带 `max_tokens` / `max_completion_tokens`。
+
+### 2026-11-10 · 推理强度改为 xhigh（已废弃）
+
+1. 出站请求带 `reasoning_effort="xhigh"`；可用 `ASK_EXPERT_REASONING_EFFORT` 覆盖
+   （默认 `xhigh`，留空表示不传，非法值启动时报错）。
+2. 原因：`max` 在固定输出预算下会让复杂问题正文为 0 字（见 2026-11-09 记录）；
+   `xhigh` 是高强度与「能收尾」之间的折中。
+3. `PROMPT_VERSION` 升至 `2026-11-10.1`，不同强度档位的缓存不混用。
+4. `test_offline.py` 断言请求体带 `xhigh` 且不带 `max_tokens` / `max_completion_tokens`。
+
+### 2026-11-09 · 移除推理强度参数（恢复模型默认）
+
+1. 删除 `ASK_EXPERT_REASONING_EFFORT` 配置与出站 `reasoning_effort` 参数，回到模型默认档。
+2. 原因：实测中转在 OpenAI 兼容与 Anthropic 原生协议下都忽略 `max_tokens` /
+   `max_completion_tokens`，输出预算固定；`reasoning_effort="max"` 使一次复杂咨询在
+   `completion_tokens=28826` 处 `finish_reason=length`、正文 0 字。
+3. `PROMPT_VERSION` 升至 `2026-11-09.2`，max 档位产生的缓存不再复用。
+4. `test_offline.py` 改为断言出站请求不携带 `reasoning_effort` / `max_tokens` /
+   `max_completion_tokens`。
+
 ### 2026-11-09 · 异步任务（提交即返回 + 状态查询）
 
 1. `consult_expert` / `audit_artifact` 默认改为后台任务：新增 `background`（默认 true）
@@ -403,11 +430,11 @@ uv run ask-expert              # 启动 stdio 服务（同样需要三项环境�
 5. 运行中可从 `state/partial/<consult_id>.txt` 读取已输出字数（不返回半截正文，
    避免调用方把半成品当结论）。
 6. 实网验证：真实 stdio 传输层提交 → 2 秒拿到 `task_id` → 长轮询 11 秒取回完整结果
-   （该次真实调用同时确认 `reasoning_effort="max"` 被端点接受，见下条更正）。
+   （该次真实调用同时确认 `reasoning_effort="max"` 被端点接受；该参数随后已移除）。
 7. `test_offline.py` 新增后台任务用例：提交/运行中/完成、未知与非法 task_id、
    落盘与列表、宽限期直返、审计路径、工具 schema 默认值。
 
-### 2026-11-09 · 默认使用最高推理强度
+### 2026-11-09 · 默认使用最高推理强度（已于同日移除）
 
 1. 出站请求新增顶层 `reasoning_effort="max"`（此前完全不传，走模型默认 `medium`）。
    依据 Anthropic / OpenAI 官方档位定义：`claude-opus-5-5` 与 `gpt-6-astra` 的最高档均为 `max`。

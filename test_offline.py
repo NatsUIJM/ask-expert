@@ -7,7 +7,6 @@ consult 记录与 prior_consult_id 注入、工具 schema。
 
 import asyncio
 import json
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +16,6 @@ import ask_expert.server as s
 
 # 端到端用例会把 _stream_consult 换成假实现；推理强度专项用例需要真实实现。
 _REAL_STREAM_CONSULT = s._stream_consult
-_REAL_GET_CLIENT = s._get_client
 
 
 def main() -> None:
@@ -179,7 +177,7 @@ def main() -> None:
         result.think_chars = 10
         if on_partial is not None:
             on_partial(result.answer)
-        return result, 0, True
+        return result, 0
 
     s._stream_consult = fake_stream
     s.API_KEY, s.BASE_URL, s.MODEL = "test", "http://localhost:1/v1", "test-model"
@@ -295,7 +293,7 @@ def main() -> None:
         result.chunks = 1
         result.ttft_ms = 1
         result.think_chars = 10
-        return result, 0, True
+        return result, 0
 
     s._stream_consult = fake_audit_stream
     s.API_KEY, s.BASE_URL, s.MODEL = "test", "http://localhost:1/v1", "test-model"
@@ -366,7 +364,7 @@ def main() -> None:
         result.chunks = 1
         result.ttft_ms = 1
         result.think_chars = 1
-        return result, 0, True
+        return result, 0
 
     s._stream_consult = fake_att_stream
     s.API_KEY, s.BASE_URL, s.MODEL = "test", "http://localhost:1/v1", "test-model"
@@ -427,14 +425,10 @@ def main() -> None:
 
     asyncio.run(schema())
 
-    print("== reasoning effort: 默认最高档 ==")
+    print("== 出站请求携带 high、不携带 token 上限 ==")
     s._stream_consult = _REAL_STREAM_CONSULT
-    assert s.PROMPT_VERSION == "2026-11-09.1"
-    assert s.REASONING_EFFORT == "max", s.REASONING_EFFORT
-    assert "max" in s.ALLOWED_REASONING_EFFORTS
-    print("default:", s.REASONING_EFFORT, "| prompt_version:", s.PROMPT_VERSION)
-
-    print("== reasoning effort: 出站请求体确实带 max ==")
+    assert s.PROMPT_VERSION == "2026-11-10.2"
+    assert s.REASONING_EFFORT == "high", s.REASONING_EFFORT
     # 用假客户端捕获 _stream_consult 组装的 kwargs，不发网络请求。
     seen: list[dict] = []
 
@@ -465,78 +459,14 @@ def main() -> None:
 
     s._get_client = lambda **kwargs: _FakeClient()
     s.MIN_CALL_INTERVAL = 0.0
-    result, retries, effort_applied = asyncio.run(
+    result, retries = asyncio.run(
         s._stream_consult("probe", api_key="k", base_url="http://x/v1", model="m")
     )
-    assert seen and seen[0].get("reasoning_effort") == "max", seen
-    assert effort_applied is True and retries == 0
-    assert result.answer == "OK"
-    assert "max_tokens" not in seen[0] and "max_completion_tokens" not in seen[0]
-    print("request body reasoning_effort:", seen[0]["reasoning_effort"])
-
-    print("== reasoning effort: 端点 400 时降级一次、不消耗重试预算 ==")
-    from openai import APIStatusError
-
-    def _status_400():
-        return APIStatusError(
-            "unsupported parameter reasoning_effort",
-            response=SimpleNamespace(status_code=400, headers={}, request=None),
-            body=None,
-        )
-
-    class _RejectThenAccept:
-        def __init__(self):
-            self.calls: list[dict] = []
-
-        async def create(self, **kwargs):
-            self.calls.append(kwargs)
-            if "reasoning_effort" in kwargs:
-                raise _status_400()
-            payload = SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        delta=SimpleNamespace(content="fallback OK", reasoning_content=None),
-                        finish_reason="stop",
-                    )
-                ],
-                usage=None,
-            )
-
-            class _OneShot:
-                def __aiter__(self):
-                    async def gen():
-                        yield payload
-
-                    return gen()
-
-            return _OneShot()
-
-    rejector = _RejectThenAccept()
-    s._get_client = lambda **kwargs: SimpleNamespace(
-        chat=SimpleNamespace(completions=rejector)
-    )
-    result2, retries2, effort_applied2 = asyncio.run(
-        s._stream_consult("probe2", api_key="k", base_url="http://x/v1", model="m")
-    )
-    assert len(rejector.calls) == 2, rejector.calls
-    assert "reasoning_effort" in rejector.calls[0]
-    assert "reasoning_effort" not in rejector.calls[1]
-    assert effort_applied2 is False and retries2 == 0
-    assert result2.answer == "fallback OK"
-    print("calls:", [sorted(c.keys()) for c in rejector.calls], "| retries:", retries2)
-
-    print("== reasoning effort: 环境变量非法值应被拒 ==")
-    import subprocess
-
-    bad = subprocess.run(
-        [sys.executable, "-c", "import ask_expert.server"],
-        env={**dict(os.environ), "ASK_EXPERT_REASONING_EFFORT": "ultra"},
-        capture_output=True,
-        text=True,
-        cwd=str(Path(__file__).resolve().parent),
-    )
-    assert bad.returncode != 0 and "ASK_EXPERT_REASONING_EFFORT" in bad.stderr
-    print("invalid env rejected:", bad.stderr.strip().splitlines()[-1][:120])
+    assert seen[0].get("reasoning_effort") == "high", seen
+    forbidden = {"max_tokens", "max_completion_tokens"}
+    assert not (forbidden & set(seen[0])), seen
+    assert result.answer == "OK" and retries == 0
+    print("request keys:", sorted(seen[0].keys()))
 
     print("== background task: submit -> status -> result ==")
     import re as _re

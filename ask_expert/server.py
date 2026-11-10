@@ -110,24 +110,21 @@ def _missing_required_env(
     return [(name, desc) for name, desc in REQUIRED_ENV_VARS if not values[name]]
 
 
-# 推理强度：默认取模型支持的最高档 max。OpenAI 兼容协议用顶层 reasoning_effort
-# （Anthropic 原生协议为 output_config.effort，由中转做协议转换）。
-# claude-opus-5-5 的思考档位 low < medium < high < xhigh < max，默认 medium；
-# max 为「最易触发思考且思考最深、不限制思考长度」。gpt-6-astra 同样支持 max。
-# 留空字符串即不传该参数（回落模型默认），用于不支持推理强度的旧模型。
+# 推理强度：默认 high。max 会让复杂问题把固定的输出预算全部耗在推理上
+# （2026-11-09 实测：28,826 completion tokens 处 finish_reason=length、正文 0 字）；
+# xhigh 在实测中同样表现不佳，故退到 high。留空字符串表示不传（回落模型默认）。
 ALLOWED_REASONING_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
-_reasoning_effort_raw = os.environ.get("ASK_EXPERT_REASONING_EFFORT", "max").strip().lower()
-if _reasoning_effort_raw and _reasoning_effort_raw not in ALLOWED_REASONING_EFFORTS:
+REASONING_EFFORT = os.environ.get("ASK_EXPERT_REASONING_EFFORT", "high").strip().lower()
+if REASONING_EFFORT and REASONING_EFFORT not in ALLOWED_REASONING_EFFORTS:
     raise ValueError(
         f"ASK_EXPERT_REASONING_EFFORT 必须是以下之一（或留空表示不传）："
-        f"{', '.join(sorted(ALLOWED_REASONING_EFFORTS))}；收到 {_reasoning_effort_raw!r}"
+        f"{', '.join(sorted(ALLOWED_REASONING_EFFORTS))}；收到 {REASONING_EFFORT!r}"
     )
-REASONING_EFFORT = _reasoning_effort_raw
 
-# 不设 max_tokens：由模型自行决定输出长度。设上限会导致中转侧把预算耗在推理上、
-# 答案 content 为空（实测 max_tokens=4096 时一道证明题推理即耗尽 4096）。
+# 不设 max_tokens / max_completion_tokens：中转会忽略这两个参数（见上），
+# 传了也不生效；早期设 max_tokens=4096 还曾导致推理耗尽预算、答案为 0 字。
 TEMPERATURE = float(os.environ.get("ASK_EXPERT_TEMPERATURE", "0.3"))
 TIMEOUT = float(os.environ.get("ASK_EXPERT_TIMEOUT", "600"))
 STREAM_RETRIES = int(os.environ.get("ASK_EXPERT_STREAM_RETRIES", "2"))
@@ -191,7 +188,10 @@ MAX_EVIDENCE_FILES = int(os.environ.get("ASK_EXPERT_MAX_EVIDENCE_FILES", "8"))
 # 避免同一模型名在不同端点之间串用缓存。
 # 2026-11-09.1：出站请求默认带 reasoning_effort="max"（此前不传、走模型默认
 # medium），旧缓存是较低推理强度下的结果，必须全部失效。
-PROMPT_VERSION = "2026-11-09.1"
+# 2026-11-09.2：移除推理强度参数，恢复模型默认；max 档位的缓存不得参与复用。
+# 2026-11-10.1：推理强度改为 xhigh（max 会耗尽固定输出预算、正文为空）。
+# 2026-11-10.2：xhigh 表现仍不佳，退到 high；不同档位的缓存不混用。
+PROMPT_VERSION = "2026-11-10.2"
 # 专家答不了时，用这个固定小节标题声明缺少什么；服务端据此返回 needs_evidence
 NEEDS_EVIDENCE_MARKER = "【需要补充的信息】"
 
@@ -1179,24 +1179,19 @@ async def _stream_consult(
     api_key: str = "",
     base_url: str = "",
     model: str = "",
-) -> tuple[_StreamResult, int, bool]:
+) -> tuple[_StreamResult, int]:
     """发起流式调用并累计结果。对可重试错误做有限次退避重试。
 
     system_prompt 为空时使用咨询模式的默认人设；审计模式传入审计员人设。
     api_key/base_url/model 为空时用环境变量配置，非空时覆盖。
-    返回 (结果, 实际重试次数, 本次是否成功带上了 reasoning_effort)。
-    第三项用于日志标定：端点不认识该参数时会降级为不带参数。
+    返回 (结果, 实际重试次数)。
     """
     resolved_url, resolved_key, resolved_model = _effective_conn(
         api_key=api_key, base_url=base_url, model=model
     )
     client = _get_client(base_url=resolved_url, api_key=resolved_key)
     last_exc: Exception | None = None
-    # 部分端点/模型不认识 reasoning_effort，会返回 400。此时只降级一次：
-    # 去掉该参数重试，保证换模型后 MCP 仍可用；降级记入日志供排查。
-    effort_enabled = bool(REASONING_EFFORT)
-    attempt = 0
-    while attempt <= STREAM_RETRIES:
+    for attempt in range(STREAM_RETRIES + 1):
         # 节流进度通知：每 PROGRESS_INTERVAL 秒至多一条，避免通知风暴
         state = {"last": 0.0}
 
@@ -1233,7 +1228,7 @@ async def _stream_consult(
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
-            if effort_enabled:
+            if REASONING_EFFORT:
                 request_kwargs["reasoning_effort"] = REASONING_EFFORT
             # 同时出站调用数受限；排队时不占连接，也不阻塞事件循环。
             async with _consult_semaphore:
@@ -1247,26 +1242,8 @@ async def _stream_consult(
                 )
             if result.chunks == 0:
                 raise APIConnectionError(request=None)  # 空流视同传输失败，进入重试
-            return result, attempt, effort_enabled
+            return result, attempt
         except Exception as exc:  # noqa: BLE001
-            # 400 通常是不重试的语义错误，但「端点不认识 reasoning_effort」是一个
-            # 例外：去掉参数重试一次，且不计入常规重试预算（避免白耗掉重试次数）。
-            # effort_enabled 置 False 后本分支最多进入一次，不会形成死循环。
-            if (
-                effort_enabled
-                and isinstance(exc, APIStatusError)
-                and exc.status_code == 400
-            ):
-                effort_enabled = False
-                _log(
-                    {
-                        "event": "reasoning_effort_unsupported",
-                        "effort": REASONING_EFFORT,
-                        "model": resolved_model,
-                        "error": f"{type(exc).__name__}: {exc}"[:300],
-                    }
-                )
-                continue
             if not _is_retryable(exc) or attempt >= STREAM_RETRIES:
                 raise
             last_exc = exc
@@ -1279,7 +1256,6 @@ async def _stream_consult(
                 }
             )
             await asyncio.sleep(1.5 * (attempt + 1))
-            attempt += 1
     raise last_exc if last_exc else RuntimeError("unreachable")
 
 
@@ -1481,7 +1457,7 @@ async def _run_expert(
     saver = _PartialSaver(consult_id)
     started = time.monotonic()
     try:
-        stream_result, retries, effort_applied = await _stream_consult(
+        stream_result, retries = await _stream_consult(
             prompt,
             ctx,
             saver.update,
@@ -1583,7 +1559,7 @@ async def _run_expert(
             "prompt_version": PROMPT_VERSION,
             "model": resolved_model,
             "base_url": resolved_url,
-            "reasoning_effort": REASONING_EFFORT if effort_applied else "",
+            "reasoning_effort": REASONING_EFFORT,
             "prior_consult_id": prior_id,
             "usage": stream_result.usage,
         }
