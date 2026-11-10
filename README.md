@@ -248,6 +248,10 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
   支持进度上报时可见输出在增长。通知失败不影响主流程。
 - **重试**：对超时、连接错误、502/503/504/429 等做最多 2 次退避重试（1.5s、3.0s）。
   400 类（如守卫拒绝）不重试——重试既无效也是对 provider 策略的不尊重。
+- **可选参数降级**：唯一例外是端点返回 400 且疑似不接受某个可选采样参数时，
+  依次去掉 `temperature`、`reasoning_effort` 各重试一次（记
+  `optional_param_unsupported` 日志，不消耗常规重试预算）；仍报 400 则照常抛出。
+  这样换到不支持这些参数的新模型/端点时 MCP 不会直接报废。
 - **超时**：`ASK_EXPERT_TIMEOUT` 默认 600 秒，须覆盖单次咨询的最坏耗时。
 
 ## 配置
@@ -278,6 +282,7 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
 | `ASK_EXPERT_MAX_CONCURRENCY` | `3` | 同时进行的出站流式调用上限，超出排队 |
 | `ASK_EXPERT_DEFAULT_WAIT_SECONDS` | `15` | 主工具后台模式默认宽限（秒） |
 | `ASK_EXPERT_MAX_STATUS_WAIT` | `600` | 状态查询单次长轮询上限（秒） |
+| `ASK_EXPERT_THINK_INLINE_LIMIT` | `20000` | 推理链内联返回阈值（字）；≥该值改为落盘返回路径 |
 | `ASK_EXPERT_MAX_ATTACHMENT_BYTES` | `512000` | 附件合计上限（字节，默认 500KB） |
 | `ASK_EXPERT_CACHE_TTL_HOURS` | `72` | 其他类型缓存的默认 TTL（小时） |
 | `ASK_EXPERT_CACHE_TTL_CODE_HOURS` | `24` | code_debug 缓存 TTL |
@@ -292,6 +297,18 @@ ASK_EXPERT_AUTO_EVIDENCE_ROUNDS=1   # 默认 0（关闭）
 | `ASK_EXPERT_MAX_EVIDENCE_FILES` | `8` | 单次自动取证处理的请求数上限 |
 
 无 `MAX_TOKENS` 配置项——刻意不提供输出上限。
+
+### 输出预算耗尽时返回推理链
+
+`finish_reason=length` 时，服务端不再只丢一句「未产出答案」，而是把已收到的完整推理链
+一并返回（推理来自 `delta.reasoning_content`，与 `content` 分开累计）：
+
+- 正文为 0 字：返回 `[未产出答案]` + 推理链。
+- 正文被截断但不为空：正常返回正文 + 处理要求，末尾附推理链。
+- 推理链 ≥ `ASK_EXPERT_THINK_INLINE_LIMIT`（默认 20000 字）：写入
+  `state/thinking/<consult_id>.md`，只返回绝对路径，不把超长文本塞进工具返回值。
+- 推理链始终标注「非最终答复，不要当作结论使用」；无任何推理文本时明确说明。
+- `call_ok` 日志新增 `think_saved_to_file` 字段。
 
 ### 推理强度与输出预算（实测）
 
@@ -391,6 +408,23 @@ uv run ask-expert              # 启动 stdio 服务（同样需要三项环境�
 验证注册命令、工具注册、参数绑定、拒绝分支与真实流式调用——含一次约 40 秒的实网调用。
 
 ## 变更记录
+
+### 2026-11-10 · 可选采样参数 400 降级
+
+1. 保留 `temperature=0.3`（仓库原有默认值，无实证依据），不再尝试删除。
+2. `_stream_consult` 捕获 HTTP 400 时，依次去掉 `temperature`、
+   `reasoning_effort` 各重试一次；记 `optional_param_unsupported` 日志，
+   不消耗常规重试预算；参数用尽后仍 400 则正常抛出，不会无限循环。
+3. `test_offline.py` 新增断言：只拒绝 temperature、两个都拒绝、降级后仍 400 三种情形。
+
+### 2026-11-10 · 输出预算耗尽时返回推理链
+
+1. `_StreamResult` 改为累计完整推理文本（`think_parts` / `think_text`），不再只记字数。
+2. `finish_reason=length` 时把推理链附在返回值中（正文为空或被截断两种情况都覆盖）。
+3. ≥ `ASK_EXPERT_THINK_INLINE_LIMIT`（默认 20000 字）时落盘到
+   `state/thinking/<consult_id>.md`，只返回绝对路径；日志新增 `think_saved_to_file`。
+4. `PROMPT_VERSION` 升至 `2026-11-10.3`；`test_offline.py` 新增三种场景断言
+   （短链内联、部分正文附链、超长落盘且文件存在可读）。
 
 ### 2026-11-10 · 推理强度退到 high
 

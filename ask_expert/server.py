@@ -125,6 +125,7 @@ if REASONING_EFFORT and REASONING_EFFORT not in ALLOWED_REASONING_EFFORTS:
 
 # 不设 max_tokens / max_completion_tokens：中转会忽略这两个参数（见上），
 # 传了也不生效；早期设 max_tokens=4096 还曾导致推理耗尽预算、答案为 0 字。
+# temperature 为仓库原有的默认值（无实证依据）；带该参数报 400 时会自动去掉重试。
 TEMPERATURE = float(os.environ.get("ASK_EXPERT_TEMPERATURE", "0.3"))
 TIMEOUT = float(os.environ.get("ASK_EXPERT_TIMEOUT", "600"))
 STREAM_RETRIES = int(os.environ.get("ASK_EXPERT_STREAM_RETRIES", "2"))
@@ -143,6 +144,10 @@ MAX_STATUS_WAIT = float(os.environ.get("ASK_EXPERT_MAX_STATUS_WAIT", "600"))
 # 主工具默认的同步宽限：任务在这么多秒内完成就直接返回结果，否则返回任务号。
 # 短咨询仍是一次调用拿到答案，长咨询不再阻塞调用方。
 DEFAULT_WAIT_SECONDS = float(os.environ.get("ASK_EXPERT_DEFAULT_WAIT_SECONDS", "15"))
+
+# 输出预算耗尽（finish_reason=length、正文为空）时把推理链返回给调用方；
+# 超过该字数则改为写入临时文件、只返回路径，避免把超长文本塞进工具返回值。
+THINK_INLINE_LIMIT = int(os.environ.get("ASK_EXPERT_THINK_INLINE_LIMIT", "20000"))
 
 # 审计模式的工件上限（字符）。超过则拒绝，避免把超长材料塞进单次咨询导致
 # 推理耗尽或跨节一致性丢失；要求调用方按章节拆分并分别声明 scope。
@@ -191,7 +196,8 @@ MAX_EVIDENCE_FILES = int(os.environ.get("ASK_EXPERT_MAX_EVIDENCE_FILES", "8"))
 # 2026-11-09.2：移除推理强度参数，恢复模型默认；max 档位的缓存不得参与复用。
 # 2026-11-10.1：推理强度改为 xhigh（max 会耗尽固定输出预算、正文为空）。
 # 2026-11-10.2：xhigh 表现仍不佳，退到 high；不同档位的缓存不混用。
-PROMPT_VERSION = "2026-11-10.2"
+# 2026-11-10.3：推理长度达上限时返回推理链，超长落盘；旧结果格式变化，缓存失效。
+PROMPT_VERSION = "2026-11-10.3"
 # 专家答不了时，用这个固定小节标题声明缺少什么；服务端据此返回 needs_evidence
 NEEDS_EVIDENCE_MARKER = "【需要补充的信息】"
 
@@ -227,8 +233,9 @@ STATE_DIR = PROJECT_ROOT / "state"
 CACHE_DIR = STATE_DIR / "cache"
 CONSULT_DIR = STATE_DIR / "consults"
 PARTIAL_DIR = STATE_DIR / "partial"
+THINK_DIR = STATE_DIR / "thinking"
 LOG_PATH = STATE_DIR / "consult_log.jsonl"
-for _state_dir in (CACHE_DIR, CONSULT_DIR, PARTIAL_DIR):
+for _state_dir in (CACHE_DIR, CONSULT_DIR, PARTIAL_DIR, THINK_DIR):
     _state_dir.mkdir(parents=True, exist_ok=True)
 
 mcp = FastMCP("ask-expert")
@@ -958,6 +965,35 @@ def _cache_set(key: str, payload: dict) -> None:
         pass
 
 
+def _save_thinking(consult_id: str, reasoning: str) -> Path | None:
+    """把完整推理链落盘到 state/thinking/<consult_id>.md，返回绝对路径。"""
+    path = THINK_DIR / f"{consult_id}.md"
+    try:
+        path.write_text(
+            f"# 推理链（输出预算耗尽）\n\nconsult_id: {consult_id}\n\n"
+            f"{reasoning}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        return None
+    return path if path.exists() and path.stat().st_size > 0 else None
+
+
+def _thinking_block(reasoning: str, think_path: Path | None) -> str:
+    """生成「推理链」附加段：超长时只给路径，否则内联全文。"""
+    if think_path is not None:
+        return (
+            f"\n\n【推理链 · {len(reasoning)} 字，已保存到临时文件】\n{think_path}"
+            "\n（文件为完整推理链，不是最终答复；不要当作结论使用。）"
+        )
+    if not reasoning:
+        return "\n\n本次未收到任何推理链文本，无可返回内容。"
+    return (
+        "\n\n【推理链 · 非最终答复，不要当作结论使用】\n"
+        "<<<REASONING\n" + reasoning + "\nREASONING>>>"
+    )
+
+
 def _new_consult_id() -> str:
     return uuid.uuid4().hex[:12]
 
@@ -1099,6 +1135,7 @@ class _StreamResult:
 
     def __init__(self) -> None:
         self.answer_parts: list[str] = []
+        self.think_parts: list[str] = []
         self.think_chars = 0
         self.chunks = 0
         self.ttft_ms: int | None = None
@@ -1108,6 +1145,11 @@ class _StreamResult:
     @property
     def answer(self) -> str:
         return "".join(self.answer_parts).strip()
+
+    @property
+    def think_text(self) -> str:
+        """完整推理链，供输出预算耗尽时返回给调用方。"""
+        return "".join(self.think_parts)
 
     @property
     def truncated_without_answer(self) -> bool:
@@ -1147,6 +1189,7 @@ async def _consume_stream(
             think = getattr(delta, "reasoning_content", None)
             if isinstance(think, str) and think:
                 result.think_chars += len(think)
+                result.think_parts.append(think)
             text = getattr(delta, "content", None)
             if isinstance(text, str) and text:
                 result.answer_parts.append(text)
@@ -1191,7 +1234,14 @@ async def _stream_consult(
     )
     client = _get_client(base_url=resolved_url, api_key=resolved_key)
     last_exc: Exception | None = None
-    for attempt in range(STREAM_RETRIES + 1):
+    # 端点/模型不认识可选采样参数时返回 400：依次去掉这些参数各重试一次。
+    # 降级不计入常规重试预算，避免白耗掉超时/502 的重试次数。
+    optional_params = []
+    if REASONING_EFFORT:
+        optional_params.append("reasoning_effort")
+    optional_params.append("temperature")
+    attempt = 0
+    while attempt <= STREAM_RETRIES:
         # 节流进度通知：每 PROGRESS_INTERVAL 秒至多一条，避免通知风暴
         state = {"last": 0.0}
 
@@ -1224,12 +1274,13 @@ async def _stream_consult(
                     {"role": "system", "content": system_prompt or EXPERT_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
-                "temperature": TEMPERATURE,
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
-            if REASONING_EFFORT:
+            if "reasoning_effort" in optional_params:
                 request_kwargs["reasoning_effort"] = REASONING_EFFORT
+            if "temperature" in optional_params:
+                request_kwargs["temperature"] = TEMPERATURE
             # 同时出站调用数受限；排队时不占连接，也不阻塞事件循环。
             async with _consult_semaphore:
                 stream = await client.chat.completions.create(**request_kwargs)
@@ -1244,6 +1295,23 @@ async def _stream_consult(
                 raise APIConnectionError(request=None)  # 空流视同传输失败，进入重试
             return result, attempt
         except Exception as exc:  # noqa: BLE001
+            # 400 通常不重试，但「端点不接受某个可选采样参数」是例外：
+            # 去掉最后一个仍在使用的可选参数重试一次（每个参数最多降级一次）。
+            if (
+                isinstance(exc, APIStatusError)
+                and exc.status_code == 400
+                and optional_params
+            ):
+                dropped = optional_params.pop()
+                _log(
+                    {
+                        "event": "optional_param_unsupported",
+                        "param": dropped,
+                        "model": resolved_model,
+                        "error": f"{type(exc).__name__}: {exc}"[:300],
+                    }
+                )
+                continue
             if not _is_retryable(exc) or attempt >= STREAM_RETRIES:
                 raise
             last_exc = exc
@@ -1256,6 +1324,7 @@ async def _stream_consult(
                 }
             )
             await asyncio.sleep(1.5 * (attempt + 1))
+            attempt += 1
     raise last_exc if last_exc else RuntimeError("unreachable")
 
 
@@ -1514,6 +1583,12 @@ async def _run_expert(
     elapsed_ms = int((time.monotonic() - started) * 1000)
     answer = stream_result.answer
     finish_reason = stream_result.finish_reason
+
+    # 输出预算耗尽（finish_reason=length）时先落盘超长推理链，日志与返回值共用同一结果。
+    think_path: Path | None = None
+    if finish_reason == "length" and len(stream_result.think_text) >= THINK_INLINE_LIMIT:
+        think_path = _save_thinking(consult_id, stream_result.think_text)
+
     body, missing_info = _extract_missing_info(answer)
     verdict = ""
     findings_count = 0
@@ -1551,6 +1626,7 @@ async def _run_expert(
             "attachment_chars": len(attachment_block),
             "answer_chars": len(answer),
             "think_chars": stream_result.think_chars,
+            "think_saved_to_file": think_path is not None,
             "chunks": stream_result.chunks,
             "ttft_ms": stream_result.ttft_ms,
             "retries": retries,
@@ -1567,6 +1643,7 @@ async def _run_expert(
 
     if stream_result.truncated_without_answer:
         saver.clear()
+        reasoning = stream_result.think_text
         _record_consult(
             consult_id=consult_id,
             objective=objective,
@@ -1578,13 +1655,14 @@ async def _run_expert(
             mode=mode,
             model=resolved_model,
         )
-        return (
+        header = (
             f"[{'审计' if is_audit else '咨询'}未产出答案 · {id_field}={consult_id}] "
             "服务端返回 finish_reason=length，推理耗尽了服务端允许的输出长度，"
             f"正文为 0 字（推理 {stream_result.think_chars} 字）。"
             "这不是质量问题，而是输入过大。请缩小范围后重试：只审一个可判定的层面/章节，"
             "或只问一个可判定的子问题，不要一次性交整套分析。"
         )
+        return header + _thinking_block(reasoning, think_path)
 
     if not answer:
         saver.clear()
@@ -1727,7 +1805,7 @@ async def _run_expert(
         notes.append(
             "[证据] 本次已自动注入部分证据；取证记录见日志 state/consult_log.jsonl。"
         )
-    return _frame(
+    frame = _frame(
         body if missing_info else answer,
         consult_id=consult_id,
         status=status,
@@ -1738,6 +1816,10 @@ async def _run_expert(
         evidence_requests=evidence_requests,
         note="\n".join(notes),
     )
+    # finish_reason=length 且已有部分正文：同样附上推理链，便于判断截断到哪一步。
+    if finish_reason == "length":
+        frame += _thinking_block(stream_result.think_text, think_path)
+    return frame
 
 
 async def _consult(

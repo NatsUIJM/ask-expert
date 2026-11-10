@@ -16,6 +16,7 @@ import ask_expert.server as s
 
 # 端到端用例会把 _stream_consult 换成假实现；推理强度专项用例需要真实实现。
 _REAL_STREAM_CONSULT = s._stream_consult
+_REAL_RUN_EXPERT = s._run_expert
 
 
 def main() -> None:
@@ -427,7 +428,7 @@ def main() -> None:
 
     print("== 出站请求携带 high、不携带 token 上限 ==")
     s._stream_consult = _REAL_STREAM_CONSULT
-    assert s.PROMPT_VERSION == "2026-11-10.2"
+    assert s.PROMPT_VERSION == "2026-11-10.3"
     assert s.REASONING_EFFORT == "high", s.REASONING_EFFORT
     # 用假客户端捕获 _stream_consult 组装的 kwargs，不发网络请求。
     seen: list[dict] = []
@@ -463,10 +464,84 @@ def main() -> None:
         s._stream_consult("probe", api_key="k", base_url="http://x/v1", model="m")
     )
     assert seen[0].get("reasoning_effort") == "high", seen
+    assert seen[0].get("temperature") == s.TEMPERATURE, seen
     forbidden = {"max_tokens", "max_completion_tokens"}
     assert not (forbidden & set(seen[0])), seen
     assert result.answer == "OK" and retries == 0
     print("request keys:", sorted(seen[0].keys()))
+
+    print("== 带可选参数 400：自动去掉参数重试 ==")
+    from openai import APIStatusError
+
+    def _status_400():
+        return APIStatusError(
+            "unsupported parameter",
+            response=SimpleNamespace(status_code=400, headers={}, request=None),
+            body=None,
+        )
+
+    class _RejectOptional:
+        def __init__(self, reject_keys):
+            self.reject_keys = set(reject_keys)
+            self.calls: list[dict] = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if self.reject_keys & set(kwargs):
+                raise _status_400()
+            payload = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="fallback OK", reasoning_content=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+
+            class _OneShot:
+                def __aiter__(self):
+                    async def gen():
+                        yield payload
+
+                    return gen()
+
+            return _OneShot()
+
+    # 只拒绝 temperature：第一次带两个参数，重试时只剩 reasoning_effort
+    rej = _RejectOptional(["temperature"])
+    s._get_client = lambda **kw: SimpleNamespace(chat=SimpleNamespace(completions=rej))
+    r, n = asyncio.run(
+        s._stream_consult("p", api_key="k", base_url="http://x/v1", model="m")
+    )
+    assert len(rej.calls) == 2, rej.calls
+    assert "temperature" in rej.calls[0] and "temperature" not in rej.calls[1]
+    assert rej.calls[1].get("reasoning_effort") == "high"
+    assert r.answer == "fallback OK" and n == 0  # 降级不消耗常规重试预算
+    print("temperature dropped, effort kept; calls:", [sorted(c) for c in rej.calls])
+
+    # 两个参数都拒绝：逐个降级，最后裸请求成功，仍不计入重试预算
+    rej2 = _RejectOptional(["temperature", "reasoning_effort"])
+    s._get_client = lambda **kw: SimpleNamespace(chat=SimpleNamespace(completions=rej2))
+    r2, n2 = asyncio.run(
+        s._stream_consult("p2", api_key="k", base_url="http://x/v1", model="m")
+    )
+    assert len(rej2.calls) == 3, rej2.calls
+    assert "temperature" not in rej2.calls[2] and "reasoning_effort" not in rej2.calls[2]
+    assert r2.answer == "fallback OK" and n2 == 0
+    print("both dropped, retries:", n2)
+
+    # 降级用完后仍 400：应抛出，不无限循环
+    rej3 = _RejectOptional(["temperature", "reasoning_effort", "model"])
+    s._get_client = lambda **kw: SimpleNamespace(chat=SimpleNamespace(completions=rej3))
+    try:
+        asyncio.run(s._stream_consult("p3", api_key="k", base_url="http://x/v1", model="m"))
+        raise AssertionError("expected 400 to propagate")
+    except APIStatusError:
+        print("terminal 400 propagates after downgrades")
+
+    # 恢复默认客户端，供后续用例使用
+    s._get_client = lambda **kwargs: _FakeClient()
 
     print("== background task: submit -> status -> result ==")
     import re as _re
@@ -552,6 +627,74 @@ def main() -> None:
               props["wait_seconds"].get("default"))
 
     asyncio.run(run_background_case())
+
+    print("== 推理长度达到上限：返回推理链 / 超长落盘 ==")
+    s._run_expert = _REAL_RUN_EXPERT
+    s.API_KEY, s.BASE_URL, s.MODEL = "k", "http://fake/v1", "fake-model"
+
+    async def run_truncation_case() -> None:
+        calls: list[dict] = []
+
+        async def fake_stream(prompt, ctx=None, on_partial=None, system_prompt=None, **kwargs):
+            r = s._StreamResult()
+            if "truncation long" in str(kwargs.get("prompt", "")) or "truncation long" in prompt:
+                # 超长推理链（>= 20000 字）
+                r.think_parts.append("推理" * 12000)
+            else:
+                # 短推理链（< 20000 字），正文为空
+                r.think_parts.append("推理链片段A\n推理链片段B")
+            r.think_chars = len(r.think_text)
+            r.finish_reason = "length"
+            r.chunks = 3
+            return r, 0
+
+        s._stream_consult = fake_stream
+
+        # 情形一：短推理链内联返回
+        out1 = await s._consult(
+            objective=f"truncation short {s._new_consult_id()}",
+            context="c", output_format="f", trigger="t",
+        )
+        assert "未产出答案" in out1 and "推理链片段A" in out1 and "推理链片段B" in out1, out1
+        assert "REASONING>>>" in out1 and "临时文件" not in out1
+        print("short chain inlined, chars:", len(out1))
+
+        # 情形二：finish_reason=length 但有部分正文时也附推理链
+        async def fake_with_answer(prompt, ctx=None, on_partial=None, system_prompt=None, **kwargs):
+            r = s._StreamResult()
+            r.think_parts.append("部分推理")
+            r.think_chars = len("部分推理")
+            r.answer_parts.append("部分正文")
+            r.finish_reason = "length"
+            r.chunks = 2
+            return r, 0
+
+        s._stream_consult = fake_with_answer
+        out2 = await s._consult(
+            objective=f"truncation with answer {s._new_consult_id()}",
+            context="c", output_format="f", trigger="t",
+        )
+        assert "部分正文" in out2 and "部分推理" in out2, out2
+        print("partial answer + chain ok")
+
+        # 情形三：>= 20000 字落盘并返回绝对路径
+        s._stream_consult = fake_stream
+        out3 = await s._consult(
+            objective=f"truncation long {s._new_consult_id()}",
+            context="c", output_format="f", trigger="t",
+        )
+        assert "未产出答案" in out3 and "已保存到临时文件" in out3, out3
+        import re as _re2
+        m = _re2.search(r"(/[^\s]+\.md)", out3)
+        assert m, out3
+        path = Path(m.group(1))
+        assert path.exists() and path.stat().st_size >= 20000, (path, path.stat().st_size)
+        assert "推理" in path.read_text(encoding="utf-8")[:200]
+        assert "推理链片段" not in out3  # 超长时不内联正文
+        print("long chain saved:", path, path.stat().st_size, "bytes")
+        path.unlink()  # 清理测试产物
+
+    asyncio.run(run_truncation_case())
 
     print("ALL OFFLINE TESTS PASS")
 
